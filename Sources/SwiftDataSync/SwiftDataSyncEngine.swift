@@ -7,12 +7,9 @@
 import CloudKit
 import Foundation
 import Observation
-import os.log
+import SimpleLogger
 
-private let logger = Logger(
-    subsystem: "com.markbattistella.SwiftDataSync",
-    category: "sync"
-)
+private let logger = SimpleLogger(category: .sync)
 
 /// Mirrors a custom CloudKit zone while an app's SwiftData adapter remains the
 /// durable local source of truth.
@@ -350,7 +347,7 @@ public final class SwiftDataSyncEngine {
             stateSerialization: loadState(forKey: stateKey),
             delegate: self
         )
-        engineConfiguration.automaticallySync = false
+        engineConfiguration.automaticallySync = true
         return engineConfiguration
     }
 

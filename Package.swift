@@ -18,9 +18,13 @@ let package = Package(
             targets: ["SwiftDataSync"]
         )
     ],
+    dependencies: [
+        .package(url: "https://github.com/markbattistella/SimpleLogger", from: "26.0.0")
+    ],
     targets: [
         .target(
             name: "SwiftDataSync",
+            dependencies: ["SimpleLogger"],
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]
