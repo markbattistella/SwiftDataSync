@@ -125,7 +125,7 @@ public final class SwiftDataSyncEngine {
 
         guard startsAutomatically else { return }
 
-        accountChangeTask = Task { [weak self, container] in
+        accountChangeTask = Task.detached { [weak self, container] in
             for await _ in NotificationCenter.default.notifications(
                 named: .CKAccountChanged,
                 object: container
@@ -146,7 +146,7 @@ public final class SwiftDataSyncEngine {
         }
     }
 
-    isolated deinit {
+    deinit {
         accountChangeTask?.cancel()
     }
 
