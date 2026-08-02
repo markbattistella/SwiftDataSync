@@ -129,8 +129,8 @@ public final class SwiftDataSyncEngine {
                 ownerName: zone.ownerName
             )
             switch zone.role {
-            case .owner: ownedZones.insert(zoneID)
-            case .participant: sharedZones.insert(zoneID)
+                case .owner: ownedZones.insert(zoneID)
+                case .participant: sharedZones.insert(zoneID)
             }
             if let collectionID = zone.collectionID {
                 zoneByCollection[collectionID] = zoneID
@@ -193,26 +193,26 @@ public final class SwiftDataSyncEngine {
             guard requestID == accountStatusRequestID else { return }
 
             switch accountStatus {
-            case .available:
-                recordSuccessfulCloudKitActivity()
+                case .available:
+                    recordSuccessfulCloudKitActivity()
 
-            case .noAccount:
-                availability = .signedOut
-                lastSyncError =
-                    "\(configuration.appName) is saving on this device. Sign in to iCloud to sync or share this \(configuration.dataName)."
+                case .noAccount:
+                    availability = .signedOut
+                    lastSyncError =
+                        "\(configuration.appName) is saving on this device. Sign in to iCloud to sync or share this \(configuration.dataName)."
 
-            case .restricted:
-                availability = .restricted
-                lastSyncError =
-                    "This device restricts iCloud access. \(configuration.appName) will keep saving your \(configuration.dataName) locally."
+                case .restricted:
+                    availability = .restricted
+                    lastSyncError =
+                        "This device restricts iCloud access. \(configuration.appName) will keep saving your \(configuration.dataName) locally."
 
-            case .couldNotDetermine, .temporarilyUnavailable:
-                availability = .temporarilyUnavailable
-                lastSyncError =
-                    "iCloud is temporarily unavailable. Your changes are saved on this device and will retry."
+                case .couldNotDetermine, .temporarilyUnavailable:
+                    availability = .temporarilyUnavailable
+                    lastSyncError =
+                        "iCloud is temporarily unavailable. Your changes are saved on this device and will retry."
 
-            @unknown default:
-                availability = .temporarilyUnavailable
+                @unknown default:
+                    availability = .temporarilyUnavailable
             }
         } catch {
             guard requestID == accountStatusRequestID else { return }
@@ -234,34 +234,34 @@ public final class SwiftDataSyncEngine {
 
     #if DEBUG
 
-        /// Supplies deterministic state for previews without contacting CloudKit.
-        ///
-        /// - Parameters:
-        ///   - ownedZoneID: A zone to preview as owned by this device, if any.
-        ///   - ownedCollectionID: The collection `ownedZoneID` routes for, if any.
-        ///   - sharedZoneID: A zone to preview as shared to this device, if any.
-        ///   - sharedCollectionID: The collection `sharedZoneID` routes for, if any.
-        public func configureForPreview(
-            ownedZoneID: CKRecordZone.ID? = nil,
-            ownedCollectionID: UUID? = nil,
-            sharedZoneID: CKRecordZone.ID? = nil,
-            sharedCollectionID: UUID? = nil,
-            availability: Availability = .available,
-            lastSyncedAt: Date? = .now
-        ) {
-            self.availability = availability
-            self.lastSyncedAt = lastSyncedAt
-            self.lastSyncError = nil
-            self.ownedZones = ownedZoneID.map { [$0] } ?? []
-            self.sharedZones = sharedZoneID.map { [$0] } ?? []
-            self.zoneByCollection = [:]
-            if let ownedZoneID, let ownedCollectionID {
-                zoneByCollection[ownedCollectionID] = ownedZoneID
-            }
-            if let sharedZoneID, let sharedCollectionID {
-                zoneByCollection[sharedCollectionID] = sharedZoneID
-            }
+    /// Supplies deterministic state for previews without contacting CloudKit.
+    ///
+    /// - Parameters:
+    ///   - ownedZoneID: A zone to preview as owned by this device, if any.
+    ///   - ownedCollectionID: The collection `ownedZoneID` routes for, if any.
+    ///   - sharedZoneID: A zone to preview as shared to this device, if any.
+    ///   - sharedCollectionID: The collection `sharedZoneID` routes for, if any.
+    public func configureForPreview(
+        ownedZoneID: CKRecordZone.ID? = nil,
+        ownedCollectionID: UUID? = nil,
+        sharedZoneID: CKRecordZone.ID? = nil,
+        sharedCollectionID: UUID? = nil,
+        availability: Availability = .available,
+        lastSyncedAt: Date? = .now
+    ) {
+        self.availability = availability
+        self.lastSyncedAt = lastSyncedAt
+        self.lastSyncError = nil
+        self.ownedZones = ownedZoneID.map { [$0] } ?? []
+        self.sharedZones = sharedZoneID.map { [$0] } ?? []
+        self.zoneByCollection = [:]
+        if let ownedZoneID, let ownedCollectionID {
+            zoneByCollection[ownedCollectionID] = ownedZoneID
         }
+        if let sharedZoneID, let sharedCollectionID {
+            zoneByCollection[sharedCollectionID] = sharedZoneID
+        }
+    }
 
     #endif
 
@@ -317,8 +317,8 @@ public final class SwiftDataSyncEngine {
                 let recordID = configuration.makeRecordID(for: change.recordID, in: zoneID)
                 let pendingChange: CKSyncEngine.PendingRecordZoneChange =
                     switch change.mutation {
-                    case .save: .saveRecord(recordID)
-                    case .delete: .deleteRecord(recordID)
+                        case .save: .saveRecord(recordID)
+                        case .delete: .deleteRecord(recordID)
                     }
 
                 let engine = engine(for: zoneID)
@@ -525,61 +525,61 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         syncEngine: CKSyncEngine
     ) async {
         switch event {
-        case .stateUpdate(let event):
-            let key =
-                syncEngine === privateEngine
-                ? privateStateKey
-                : sharedStateKey
-            saveState(event.stateSerialization, forKey: key)
+            case .stateUpdate(let event):
+                let key =
+                    syncEngine === privateEngine
+                    ? privateStateKey
+                    : sharedStateKey
+                saveState(event.stateSerialization, forKey: key)
 
-        case .fetchedRecordZoneChanges(let event):
-            applyFetchedChanges(event, syncEngine: syncEngine)
+            case .fetchedRecordZoneChanges(let event):
+                applyFetchedChanges(event, syncEngine: syncEngine)
 
-        case .fetchedDatabaseChanges(let event):
-            handleFetchedDatabaseChanges(event, syncEngine: syncEngine)
+            case .fetchedDatabaseChanges(let event):
+                handleFetchedDatabaseChanges(event, syncEngine: syncEngine)
 
-        case .sentDatabaseChanges(let event):
-            handleSentDatabaseChanges(event, syncEngine: syncEngine)
+            case .sentDatabaseChanges(let event):
+                handleSentDatabaseChanges(event, syncEngine: syncEngine)
 
-        case .sentRecordZoneChanges(let event):
-            handleSentRecordZoneChanges(event, syncEngine: syncEngine)
+            case .sentRecordZoneChanges(let event):
+                handleSentRecordZoneChanges(event, syncEngine: syncEngine)
 
-        case .accountChange(let event):
-            handleAccountChange(event)
+            case .accountChange(let event):
+                handleAccountChange(event)
 
-        case .willFetchChanges:
-            activeFetchHadError = false
+            case .willFetchChanges:
+                activeFetchHadError = false
 
-        case .didFetchRecordZoneChanges(let event):
-            if let error = event.error {
-                activeFetchHadError = true
-                lastSyncError =
-                    "iCloud couldn't finish checking the \(configuration.dataName). Local changes are safe and will retry."
-                logger.error("CloudKit fetch failed for \(event.zoneID): \(error)")
-            }
+            case .didFetchRecordZoneChanges(let event):
+                if let error = event.error {
+                    activeFetchHadError = true
+                    lastSyncError =
+                        "iCloud couldn't finish checking the \(configuration.dataName). Local changes are safe and will retry."
+                    logger.error("CloudKit fetch failed for \(event.zoneID): \(error)")
+                }
 
-        case .didFetchChanges:
-            if !activeFetchHadError {
-                lastSyncedAt = .now
-                recordSuccessfulCloudKitActivity()
-            }
+            case .didFetchChanges:
+                if !activeFetchHadError {
+                    lastSyncedAt = .now
+                    recordSuccessfulCloudKitActivity()
+                }
 
-        case .willSendChanges:
-            activeSendHadError = false
+            case .willSendChanges:
+                activeSendHadError = false
 
-        case .didSendChanges:
-            if !activeSendHadError {
-                lastSyncedAt = .now
-                recordSuccessfulCloudKitActivity()
-            }
+            case .didSendChanges:
+                if !activeSendHadError {
+                    lastSyncedAt = .now
+                    recordSuccessfulCloudKitActivity()
+                }
 
-        case .willFetchRecordZoneChanges:
-            break
+            case .willFetchRecordZoneChanges:
+                break
 
-        @unknown default:
-            logger.info(
-                "Unhandled CKSyncEngine event: \(String(describing: event))"
-            )
+            @unknown default:
+                logger.info(
+                    "Unhandled CKSyncEngine event: \(String(describing: event))"
+                )
         }
     }
 
@@ -911,31 +911,31 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         _ event: CKSyncEngine.Event.AccountChange
     ) {
         switch event.changeType {
-        case .signIn:
-            recordSuccessfulCloudKitActivity()
-            for zoneID in ownedZones {
-                ensureZoneExists(zoneID)
-            }
-            reconcileOutbox()
+            case .signIn:
+                recordSuccessfulCloudKitActivity()
+                for zoneID in ownedZones {
+                    ensureZoneExists(zoneID)
+                }
+                reconcileOutbox()
 
-        case .switchAccounts:
-            recordSuccessfulCloudKitActivity()
-            preparedZones.removeAll()
-            lastSyncError =
-                "The iCloud account changed. Local data is safe; \(configuration.appName) is preparing it for the new account."
-            for zoneID in ownedZones {
-                ensureZoneExists(zoneID)
-            }
-            requeueRecords(forCollection: nil)
+            case .switchAccounts:
+                recordSuccessfulCloudKitActivity()
+                preparedZones.removeAll()
+                lastSyncError =
+                    "The iCloud account changed. Local data is safe; \(configuration.appName) is preparing it for the new account."
+                for zoneID in ownedZones {
+                    ensureZoneExists(zoneID)
+                }
+                requeueRecords(forCollection: nil)
 
-        case .signOut:
-            availability = .signedOut
-            preparedZones.removeAll()
-            lastSyncError =
-                "Signed out of iCloud. \(configuration.appName) will keep saving on this device and resume syncing after sign-in."
+            case .signOut:
+                availability = .signedOut
+                preparedZones.removeAll()
+                lastSyncError =
+                    "Signed out of iCloud. \(configuration.appName) will keep saving on this device and resume syncing after sign-in."
 
-        @unknown default:
-            fetchChangesNow()
+            @unknown default:
+                fetchChangesNow()
         }
     }
 
