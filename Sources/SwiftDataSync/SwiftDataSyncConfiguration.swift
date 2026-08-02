@@ -7,14 +7,15 @@
 import CloudKit
 import Foundation
 
-/// The CloudKit identifiers and user-facing terminology for one shared store.
+/// The CloudKit identifiers and user-facing terminology shared by every zone
+/// one app tracks. Unlike a single-zone setup, this configuration doesn't
+/// carry a fixed zone name of its own — an app can track any number of
+/// zones side by side (see `SwiftDataSyncEngine.ensureZoneExists`), each
+/// named however the app's own model needs.
 public struct SwiftDataSyncConfiguration: Hashable, Sendable {
 
     /// The app's CloudKit container identifier.
     public let containerIdentifier: String
-
-    /// The custom record-zone name containing the shareable records.
-    public let zoneName: String
 
     /// The optional app-group suite used to persist engine state.
     public let appGroupIdentifier: String?
@@ -22,7 +23,8 @@ public struct SwiftDataSyncConfiguration: Hashable, Sendable {
     /// A prefix that keeps this engine's state keys separate from other stores.
     public let stateKeyPrefix: String
 
-    /// The title shown by the system sharing interface.
+    /// The default title shown by the system sharing interface, when a
+    /// zone-specific title isn't supplied to `prepareShare(for:title:)`.
     public let shareTitle: String
 
     /// The app name used in plain-language sync messages.
@@ -31,19 +33,17 @@ public struct SwiftDataSyncConfiguration: Hashable, Sendable {
     /// The singular name for the shared data, such as "journal" or "workspace".
     public let dataName: String
 
-    /// Creates the configuration for one shared SwiftData-backed CloudKit zone.
+    /// Creates the shared configuration for an app's zones.
     ///
     /// - Parameters:
     ///   - containerIdentifier: The app's CloudKit container identifier.
-    ///   - zoneName: The custom record-zone name containing shareable records.
     ///   - appGroupIdentifier: An optional app-group suite for persisted engine state.
     ///   - stateKeyPrefix: A prefix for the engine's persisted state keys.
-    ///   - shareTitle: The title shown by the system sharing interface.
+    ///   - shareTitle: The default title shown by the system sharing interface.
     ///   - appName: The app name used in user-facing sync messages.
     ///   - dataName: The singular name for the shared collection.
     public init(
         containerIdentifier: String,
-        zoneName: String,
         appGroupIdentifier: String? = nil,
         stateKeyPrefix: String = "SwiftDataSync",
         shareTitle: String,
@@ -51,7 +51,6 @@ public struct SwiftDataSyncConfiguration: Hashable, Sendable {
         dataName: String
     ) {
         self.containerIdentifier = containerIdentifier
-        self.zoneName = zoneName
         self.appGroupIdentifier = appGroupIdentifier
         self.stateKeyPrefix = stateKeyPrefix
         self.shareTitle = shareTitle
@@ -64,8 +63,12 @@ public struct SwiftDataSyncConfiguration: Hashable, Sendable {
         CKContainer(identifier: containerIdentifier)
     }
 
-    /// The custom zone as it appears in its owner's private database.
-    public var ownedZoneID: CKRecordZone.ID {
+    /// The zone identity for a zone this device owns, given its name — the
+    /// owner is always the current user for a zone in one's own private
+    /// database.
+    ///
+    /// - Parameter zoneName: The custom record-zone name.
+    public func ownedZoneID(named zoneName: String) -> CKRecordZone.ID {
         CKRecordZone.ID(
             zoneName: zoneName,
             ownerName: CKCurrentUserDefaultName

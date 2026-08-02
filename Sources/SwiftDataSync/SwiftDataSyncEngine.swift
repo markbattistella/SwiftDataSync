@@ -11,18 +11,26 @@ import SimpleLogger
 
 private let logger = SimpleLogger(category: .sync)
 
-/// Mirrors a custom CloudKit zone while an app's SwiftData adapter remains the
-/// durable local source of truth.
+/// Mirrors a set of custom CloudKit zones while an app's SwiftData adapter
+/// remains the durable local source of truth.
 ///
-/// The engine owns CloudKit transport, role selection, state persistence,
-/// retries, zone recovery, and private/shared database routing. The supplied
-/// ``SwiftDataSyncStore`` owns model lookup, record mapping, the durable
-/// outbox, and app-specific conflict policy.
+/// The engine owns CloudKit transport, zone tracking, state persistence,
+/// retries, zone recovery, and private/shared database routing — for
+/// however many zones the app is tracking at once, not just one. A device
+/// can simultaneously own some zones (created by this device, tracked in
+/// the private database) and participate in others (shared here by someone
+/// else, tracked in the shared database); both engines run concurrently
+/// rather than switching between a single "active" one.
+///
+/// Each zone is optionally associated with an app-defined `collectionID` —
+/// an opaque identifier (e.g. one per shareable unit in the app's own
+/// model) used only to route durable changes and fetched records to the
+/// right zone. The engine never interprets what a collection *means*.
 @MainActor
 @Observable
 public final class SwiftDataSyncEngine {
 
-    /// The device's relationship to the active shared zone.
+    /// The device's relationship to a tracked zone.
     public typealias Role = SwiftDataSyncRole
 
     /// The current availability of the configured iCloud account.
@@ -31,11 +39,11 @@ public final class SwiftDataSyncEngine {
     /// The CloudKit and presentation configuration for this engine.
     public let configuration: SwiftDataSyncConfiguration
 
-    /// The device's relationship to the active shared zone.
-    public private(set) var role: Role
+    /// Zones this device owns, tracked in its private database.
+    public private(set) var ownedZones: Set<CKRecordZone.ID> = []
 
-    /// The participant view of the owner's shared zone, when one is active.
-    public private(set) var sharedZoneID: CKRecordZone.ID?
+    /// Zones shared to this device by someone else, tracked in the shared database.
+    public private(set) var sharedZones: Set<CKRecordZone.ID> = []
 
     /// A plain-language explanation of the most recent sync failure.
     public private(set) var lastSyncError: String?
@@ -74,7 +82,16 @@ public final class SwiftDataSyncEngine {
     @ObservationIgnored
     private var accountChangeTask: Task<Void, Never>?
 
-    private var hasPreparedOwnedZone = false
+    /// Both directions of the zone ↔ collection association, kept in sync —
+    /// a handful of zones per device at most, so a plain dictionary plus a
+    /// linear reverse lookup is simpler than a bidirectional map type.
+    private var zoneByCollection: [UUID: CKRecordZone.ID] = [:]
+
+    /// Zones whose `.saveZone` has been sent this session — reset on relaunch,
+    /// same as the original single-zone engine's `hasPreparedOwnedZone`, so a
+    /// zone that never confirmed before termination is resent harmlessly.
+    private var preparedZones: Set<CKRecordZone.ID> = []
+
     private var activeFetchHadError = false
     private var activeSendHadError = false
     private var accountStatusRequestID: UInt = 0
@@ -102,22 +119,22 @@ public final class SwiftDataSyncEngine {
                 configuration: configuration
             )
         self.stateStore = resolvedStateStore
-        let persistedRoleKey = "\(configuration.stateKeyPrefix).role"
-        self.role =
-            Role(
-                rawValue: resolvedStateStore.string(forKey: persistedRoleKey) ?? ""
-            )
-            ?? .owner
 
-        let persistedOwnerKey =
-            "\(configuration.stateKeyPrefix).sharedZone.ownerName"
-        if let ownerName = resolvedStateStore.string(
-            forKey: persistedOwnerKey
+        for zone in Self.loadPersistedZones(
+            from: resolvedStateStore,
+            key: "\(configuration.stateKeyPrefix).zones"
         ) {
-            self.sharedZoneID = CKRecordZone.ID(
-                zoneName: configuration.zoneName,
-                ownerName: ownerName
+            let zoneID = CKRecordZone.ID(
+                zoneName: zone.zoneName,
+                ownerName: zone.ownerName
             )
+            switch zone.role {
+            case .owner: ownedZones.insert(zoneID)
+            case .participant: sharedZones.insert(zoneID)
+            }
+            if let collectionID = zone.collectionID {
+                zoneByCollection[collectionID] = zoneID
+            }
         }
 
         guard startsAutomatically else { return }
@@ -136,8 +153,8 @@ public final class SwiftDataSyncEngine {
             guard let self else { return }
             await refreshAccountStatus()
             guard availability == .available else { return }
-            if role == .owner {
-                ensureOwnedZoneExists()
+            for zoneID in ownedZones {
+                ensureZoneExists(zoneID)
             }
             reconcileOutbox()
         }
@@ -147,14 +164,23 @@ public final class SwiftDataSyncEngine {
         accountChangeTask?.cancel()
     }
 
-    /// The custom zone currently used by this device.
-    public var activeZoneID: CKRecordZone.ID {
-        switch role {
-        case .owner:
-            configuration.ownedZoneID
-        case .participant:
-            sharedZoneID ?? configuration.ownedZoneID
-        }
+    /// The collection identifier associated with a tracked zone, if any.
+    public func collectionID(for zoneID: CKRecordZone.ID) -> UUID? {
+        zoneByCollection.first { $0.value == zoneID }?.key
+    }
+
+    /// The zone associated with a collection identifier, if this device
+    /// owns or participates in one for it.
+    public func zoneID(forCollection collectionID: UUID) -> CKRecordZone.ID? {
+        zoneByCollection[collectionID]
+    }
+
+    /// This device's relationship to a tracked zone. `nil` if the zone
+    /// isn't tracked at all.
+    public func role(for zoneID: CKRecordZone.ID) -> Role? {
+        if ownedZones.contains(zoneID) { return .owner }
+        if sharedZones.contains(zoneID) { return .participant }
+        return nil
     }
 
     /// Refreshes the configured CloudKit account's availability.
@@ -209,40 +235,55 @@ public final class SwiftDataSyncEngine {
     #if DEBUG
 
         /// Supplies deterministic state for previews without contacting CloudKit.
+        ///
+        /// - Parameters:
+        ///   - ownedZoneID: A zone to preview as owned by this device, if any.
+        ///   - ownedCollectionID: The collection `ownedZoneID` routes for, if any.
+        ///   - sharedZoneID: A zone to preview as shared to this device, if any.
+        ///   - sharedCollectionID: The collection `sharedZoneID` routes for, if any.
         public func configureForPreview(
-            role: Role,
+            ownedZoneID: CKRecordZone.ID? = nil,
+            ownedCollectionID: UUID? = nil,
+            sharedZoneID: CKRecordZone.ID? = nil,
+            sharedCollectionID: UUID? = nil,
             availability: Availability = .available,
             lastSyncedAt: Date? = .now
         ) {
-            self.role = role
             self.availability = availability
             self.lastSyncedAt = lastSyncedAt
             self.lastSyncError = nil
-            if role == .participant {
-                self.sharedZoneID = CKRecordZone.ID(
-                    zoneName: configuration.zoneName,
-                    ownerName: "_previewOwner"
-                )
-            } else {
-                self.sharedZoneID = nil
+            self.ownedZones = ownedZoneID.map { [$0] } ?? []
+            self.sharedZones = sharedZoneID.map { [$0] } ?? []
+            self.zoneByCollection = [:]
+            if let ownedZoneID, let ownedCollectionID {
+                zoneByCollection[ownedCollectionID] = ownedZoneID
+            }
+            if let sharedZoneID, let sharedCollectionID {
+                zoneByCollection[sharedCollectionID] = sharedZoneID
             }
         }
 
     #endif
 
-    /// Fetches remote changes after first reconciling durable local changes.
+    /// Fetches remote changes across every tracked zone after first
+    /// reconciling durable local changes.
     public func fetchChangesNow() {
         Task { [weak self] in
             guard let self else { return }
             await refreshAccountStatus()
             guard availability == .available else { return }
-            if role == .owner {
-                ensureOwnedZoneExists()
+            for zoneID in ownedZones {
+                ensureZoneExists(zoneID)
             }
             reconcileOutbox()
 
             do {
-                try await activeEngine.fetchChanges()
+                if !ownedZones.isEmpty {
+                    try await privateEngine.fetchChanges()
+                }
+                if !sharedZones.isEmpty {
+                    try await sharedEngine.fetchChanges()
+                }
                 recordSuccessfulCloudKitActivity()
             } catch {
                 recordTransientSyncFailure(error)
@@ -250,29 +291,50 @@ public final class SwiftDataSyncEngine {
         }
     }
 
-    /// Rehydrates the engine's pending changes from the adapter's durable outbox.
+    /// Rehydrates the engine's pending changes from the adapter's durable
+    /// outbox, routing each one to the zone its `collectionID` maps to.
+    /// Changes whose collection isn't tracked by any zone yet are left in
+    /// the outbox untouched rather than guessed into the wrong zone.
     public func reconcileOutbox() {
         do {
             let changes = try store.pendingChanges()
             guard !changes.isEmpty, availability == .available else { return }
 
-            let pendingChanges = try changes.map { change in
-                try store.markAttempted(change, errorCategory: nil)
-                let recordID = configuration.makeRecordID(
-                    for: change.recordID,
-                    in: activeZoneID
-                )
-                switch change.mutation {
-                case .save:
-                    return CKSyncEngine.PendingRecordZoneChange.saveRecord(recordID)
-                case .delete:
-                    return CKSyncEngine.PendingRecordZoneChange.deleteRecord(recordID)
+            var changesByEngine: [ObjectIdentifier: [CKSyncEngine.PendingRecordZoneChange]] =
+                [:]
+
+            for change in changes {
+                guard let collectionID = change.collectionID,
+                    let zoneID = zoneByCollection[collectionID]
+                else {
+                    logger.error(
+                        "Skipping outbox change for unresolvable collection: \(change.recordID)"
+                    )
+                    continue
                 }
+
+                try store.markAttempted(change, errorCategory: nil)
+                let recordID = configuration.makeRecordID(for: change.recordID, in: zoneID)
+                let pendingChange: CKSyncEngine.PendingRecordZoneChange =
+                    switch change.mutation {
+                    case .save: .saveRecord(recordID)
+                    case .delete: .deleteRecord(recordID)
+                    }
+
+                let engine = engine(for: zoneID)
+                changesByEngine[ObjectIdentifier(engine), default: []].append(pendingChange)
             }
 
-            activeEngine.state.add(pendingRecordZoneChanges: pendingChanges)
             try store.save()
-            sendChanges(using: activeEngine)
+
+            if let privateChanges = changesByEngine[ObjectIdentifier(privateEngine)] {
+                privateEngine.state.add(pendingRecordZoneChanges: privateChanges)
+                sendChanges(using: privateEngine)
+            }
+            if let sharedChanges = changesByEngine[ObjectIdentifier(sharedEngine)] {
+                sharedEngine.state.add(pendingRecordZoneChanges: sharedChanges)
+                sendChanges(using: sharedEngine)
+            }
         } catch {
             lastSyncError =
                 "\(configuration.appName) couldn't prepare changes for iCloud. Your \(configuration.dataName) remains saved on this device."
@@ -280,28 +342,56 @@ public final class SwiftDataSyncEngine {
         }
     }
 
-    /// Switches this device from its private collection to an accepted shared zone.
+    /// Registers a zone this device owns — creating it in CloudKit if it
+    /// doesn't already exist there. Safe to call repeatedly (e.g. once per
+    /// owned zone at every launch, to re-verify a zone that never confirmed
+    /// creation before the app last terminated) — a zone already tracked
+    /// and already confirmed this session is a no-op.
     ///
-    /// The adapter receives a chance to archive local data first. Existing local
-    /// data is never uploaded into the newly accepted share automatically.
+    /// - Parameters:
+    ///   - zoneID: The zone to create/verify in the owner's private database.
+    ///   - collectionID: The app-defined identifier this zone belongs to, if any.
+    public func ensureZoneExists(_ zoneID: CKRecordZone.ID, collectionID: UUID? = nil) {
+        let isNewZone = ownedZones.insert(zoneID).inserted
+        if let collectionID {
+            zoneByCollection[collectionID] = zoneID
+        }
+        if isNewZone || collectionID != nil {
+            persistZones()
+        }
+
+        guard availability == .available, !preparedZones.contains(zoneID) else { return }
+        privateEngine.state.add(
+            pendingDatabaseChanges: [.saveZone(CKRecordZone(zoneID: zoneID))]
+        )
+        preparedZones.insert(zoneID)
+        sendChanges(using: privateEngine)
+    }
+
+    /// Adopts a zone someone else shared to this device, alongside whatever
+    /// other zones this device already owns or participates in — accepting
+    /// one shared collection never disturbs any other.
     ///
-    /// - Parameter zoneID: The accepted zone in the participant's shared database.
-    public func adoptSharedZone(_ zoneID: CKRecordZone.ID) {
+    /// - Parameters:
+    ///   - zoneID: The accepted zone in the participant's shared database.
+    ///   - collectionID: The app-defined identifier this zone belongs to, if any.
+    public func adoptSharedZone(_ zoneID: CKRecordZone.ID, collectionID: UUID? = nil) {
         do {
-            try store.prepareToAdoptShare()
+            try store.prepareToAdoptShare(collectionID: collectionID)
             try store.save()
         } catch {
             store.rollback()
             lastSyncError =
-                "The invitation was accepted, but \(configuration.appName) couldn't protect the current \(configuration.dataName). No local data was deleted."
+                "The invitation was accepted, but \(configuration.appName) couldn't protect existing local data. No local data was deleted."
             logger.error("Failed to prepare local data before share switch: \(error)")
             return
         }
 
-        sharedZoneID = zoneID
-        role = .participant
-        stateStore.set(zoneID.ownerName, forKey: sharedZoneOwnerNameKey)
-        stateStore.set(Role.participant.rawValue, forKey: roleKey)
+        sharedZones.insert(zoneID)
+        if let collectionID {
+            zoneByCollection[collectionID] = zoneID
+        }
+        persistZones()
 
         Task { [weak self] in
             guard let self else { return }
@@ -315,10 +405,6 @@ public final class SwiftDataSyncEngine {
         }
     }
 
-    private var roleKey: String {
-        "\(configuration.stateKeyPrefix).role"
-    }
-
     private var privateStateKey: String {
         "\(configuration.stateKeyPrefix).state.private"
     }
@@ -327,14 +413,55 @@ public final class SwiftDataSyncEngine {
         "\(configuration.stateKeyPrefix).state.shared"
     }
 
-    private var sharedZoneOwnerNameKey: String {
-        "\(configuration.stateKeyPrefix).sharedZone.ownerName"
+    private var zonesKey: String {
+        "\(configuration.stateKeyPrefix).zones"
     }
 
-    private var activeEngine: CKSyncEngine {
-        switch role {
-        case .owner: privateEngine
-        case .participant: sharedEngine
+    private func engine(for zoneID: CKRecordZone.ID) -> CKSyncEngine {
+        ownedZones.contains(zoneID) ? privateEngine : sharedEngine
+    }
+
+    private struct PersistedZone: Codable {
+        let zoneName: String
+        let ownerName: String
+        let collectionID: UUID?
+        let role: SwiftDataSyncRole
+    }
+
+    private static func loadPersistedZones(
+        from stateStore: any SwiftDataSyncStateStore,
+        key: String
+    ) -> [PersistedZone] {
+        guard let data = stateStore.data(forKey: key) else { return [] }
+        do {
+            return try JSONDecoder().decode([PersistedZone].self, from: data)
+        } catch {
+            logger.error("Failed to restore tracked zones: \(error)")
+            return []
+        }
+    }
+
+    private func persistZones() {
+        let owned = ownedZones.map { zoneID in
+            PersistedZone(
+                zoneName: zoneID.zoneName,
+                ownerName: zoneID.ownerName,
+                collectionID: collectionID(for: zoneID),
+                role: .owner
+            )
+        }
+        let shared = sharedZones.map { zoneID in
+            PersistedZone(
+                zoneName: zoneID.zoneName,
+                ownerName: zoneID.ownerName,
+                collectionID: collectionID(for: zoneID),
+                role: .participant
+            )
+        }
+        do {
+            stateStore.set(try JSONEncoder().encode(owned + shared), forKey: zonesKey)
+        } catch {
+            logger.error("Failed to persist tracked zones: \(error)")
         }
     }
 
@@ -380,17 +507,6 @@ public final class SwiftDataSyncEngine {
         }
     }
 
-    private func ensureOwnedZoneExists() {
-        guard availability == .available, !hasPreparedOwnedZone else { return }
-        privateEngine.state.add(
-            pendingDatabaseChanges: [
-                .saveZone(CKRecordZone(zoneID: configuration.ownedZoneID))
-            ]
-        )
-        hasPreparedOwnedZone = true
-        sendChanges(using: privateEngine)
-    }
-
     private func sendChanges(using engine: CKSyncEngine) {
         Task { [weak self] in
             do {
@@ -417,8 +533,7 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
             saveState(event.stateSerialization, forKey: key)
 
         case .fetchedRecordZoneChanges(let event):
-            guard syncEngine === activeEngine else { return }
-            applyFetchedChanges(event)
+            applyFetchedChanges(event, syncEngine: syncEngine)
 
         case .fetchedDatabaseChanges(let event):
             handleFetchedDatabaseChanges(event, syncEngine: syncEngine)
@@ -433,11 +548,9 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
             handleAccountChange(event)
 
         case .willFetchChanges:
-            guard syncEngine === activeEngine else { return }
             activeFetchHadError = false
 
         case .didFetchRecordZoneChanges(let event):
-            guard syncEngine === activeEngine else { return }
             if let error = event.error {
                 activeFetchHadError = true
                 lastSyncError =
@@ -446,18 +559,15 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
             }
 
         case .didFetchChanges:
-            guard syncEngine === activeEngine else { return }
             if !activeFetchHadError {
                 lastSyncedAt = .now
                 recordSuccessfulCloudKitActivity()
             }
 
         case .willSendChanges:
-            guard syncEngine === activeEngine else { return }
             activeSendHadError = false
 
         case .didSendChanges:
-            guard syncEngine === activeEngine else { return }
             if !activeSendHadError {
                 lastSyncedAt = .now
                 recordSuccessfulCloudKitActivity()
@@ -477,8 +587,6 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         _ context: CKSyncEngine.SendChangesContext,
         syncEngine: CKSyncEngine
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
-        guard syncEngine === activeEngine else { return nil }
-
         let pendingEngineChanges =
             syncEngine.state.pendingRecordZoneChanges.filter {
                 context.options.scope.contains($0)
@@ -535,30 +643,45 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         ) { materialisedRecords[$0] }
     }
 
+    /// Groups a fetch event's modifications/deletions by zone and applies
+    /// each zone's batch separately, since different zones in the same
+    /// fetch can belong to different collections with different roles.
     private func applyFetchedChanges(
-        _ event: CKSyncEngine.Event.FetchedRecordZoneChanges
+        _ event: CKSyncEngine.Event.FetchedRecordZoneChanges,
+        syncEngine: CKSyncEngine
     ) {
-        let records = event.modifications.map(\.record).filter {
-            $0.recordID.zoneID == activeZoneID
-        }
-        let deletedRecordIDs = event.deletions.map(\.recordID).filter {
-            $0.zoneID == activeZoneID
-        }
+        let trackedZones = syncEngine === privateEngine ? ownedZones : sharedZones
+        let resolvedRole: Role = syncEngine === privateEngine ? .owner : .participant
 
-        do {
-            let didChange = try store.applyFetchedChanges(
-                records: records,
-                deletedRecordIDs: deletedRecordIDs,
-                role: role
-            )
-            guard didChange else { return }
-            try store.save()
-            store.didApplyRemoteChanges()
-        } catch {
-            store.rollback()
-            lastSyncError =
-                "\(configuration.appName) received iCloud changes but couldn't save them locally. It will retry."
-            logger.error("Failed to apply fetched CloudKit changes: \(error)")
+        let modificationsByZone = Dictionary(
+            grouping: event.modifications,
+            by: { $0.record.recordID.zoneID }
+        )
+        let deletionsByZone = Dictionary(
+            grouping: event.deletions,
+            by: { $0.recordID.zoneID }
+        )
+        let zoneIDs = Set(modificationsByZone.keys).union(deletionsByZone.keys)
+
+        for zoneID in zoneIDs where trackedZones.contains(zoneID) {
+            let records = (modificationsByZone[zoneID] ?? []).map(\.record)
+            let deletedRecordIDs = (deletionsByZone[zoneID] ?? []).map(\.recordID)
+
+            do {
+                let didChange = try store.applyFetchedChanges(
+                    records: records,
+                    deletedRecordIDs: deletedRecordIDs,
+                    role: resolvedRole
+                )
+                guard didChange else { continue }
+                try store.save()
+                store.didApplyRemoteChanges()
+            } catch {
+                store.rollback()
+                lastSyncError =
+                    "\(configuration.appName) received iCloud changes but couldn't save them locally. It will retry."
+                logger.error("Failed to apply fetched CloudKit changes: \(error)")
+            }
         }
     }
 
@@ -566,20 +689,17 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         _ event: CKSyncEngine.Event.FetchedDatabaseChanges,
         syncEngine: CKSyncEngine
     ) {
-        guard syncEngine === activeEngine else { return }
+        for deletion in event.deletions {
+            let zoneID = deletion.zoneID
 
-        for deletion in event.deletions
-        where deletion.zoneID == activeZoneID {
-            switch role {
-            case .participant:
-                recoverFromRevokedShare()
-
-            case .owner:
-                hasPreparedOwnedZone = false
+            if syncEngine === sharedEngine, sharedZones.contains(zoneID) {
+                recoverFromRevokedShare(zoneID)
+            } else if syncEngine === privateEngine, ownedZones.contains(zoneID) {
+                preparedZones.remove(zoneID)
                 lastSyncError =
-                    "The iCloud \(configuration.dataName) zone was reset. Your local data is safe and will be uploaded again."
-                ensureOwnedZoneExists()
-                requeueAllRecords()
+                    "An iCloud \(configuration.dataName) zone was reset. Your local data is safe and will be uploaded again."
+                ensureZoneExists(zoneID)
+                requeueRecords(forCollection: collectionID(for: zoneID))
             }
         }
     }
@@ -588,18 +708,16 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         _ event: CKSyncEngine.Event.SentDatabaseChanges,
         syncEngine: CKSyncEngine
     ) {
-        guard role == .owner, syncEngine === privateEngine else { return }
+        guard syncEngine === privateEngine else { return }
 
-        if event.savedZones.contains(where: {
-            $0.zoneID == configuration.ownedZoneID
-        }) {
-            hasPreparedOwnedZone = true
+        for savedZone in event.savedZones where ownedZones.contains(savedZone.zoneID) {
+            preparedZones.insert(savedZone.zoneID)
         }
 
         for failure in event.failedZoneSaves
-        where failure.zone.zoneID == configuration.ownedZoneID {
+        where ownedZones.contains(failure.zone.zoneID) {
             activeSendHadError = true
-            hasPreparedOwnedZone = false
+            preparedZones.remove(failure.zone.zoneID)
 
             if SwiftDataSyncRetryPolicy.shouldRetry(failure.error.code) {
                 syncEngine.state.add(
@@ -616,8 +734,7 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
             )
         }
 
-        for (zoneID, error) in event.failedZoneDeletes
-        where zoneID == configuration.ownedZoneID {
+        for (zoneID, error) in event.failedZoneDeletes where ownedZones.contains(zoneID) {
             activeSendHadError = true
             lastSyncError =
                 "iCloud couldn't finish a shared-zone change. Your local data was not deleted."
@@ -625,31 +742,30 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
     }
 
-    private func recoverFromRevokedShare() {
-        role = .owner
-        sharedZoneID = nil
-        hasPreparedOwnedZone = false
-        stateStore.set(Role.owner.rawValue, forKey: roleKey)
-        stateStore.removeValue(forKey: sharedZoneOwnerNameKey)
+    private func recoverFromRevokedShare(_ zoneID: CKRecordZone.ID) {
+        let revokedCollectionID = collectionID(for: zoneID)
+        sharedZones.remove(zoneID)
+        if let revokedCollectionID {
+            zoneByCollection.removeValue(forKey: revokedCollectionID)
+        }
+        persistZones()
 
         do {
-            try store.recoverFromRevokedShare()
+            try store.recoverFromRevokedShare(collectionID: revokedCollectionID)
             try store.save()
-            ensureOwnedZoneExists()
-            reconcileOutbox()
             lastSyncError =
-                "Access to the shared \(configuration.dataName) ended. It was retained locally, and \(configuration.appName) started a new private \(configuration.dataName) without deleting anything."
+                "Access to a shared \(configuration.dataName) ended. It was retained locally where possible."
         } catch {
             store.rollback()
             lastSyncError =
-                "Access to the shared \(configuration.dataName) ended. Local data was retained, but \(configuration.appName) couldn't start a new \(configuration.dataName)."
+                "Access to a shared \(configuration.dataName) ended, but \(configuration.appName) couldn't finish cleaning up locally."
             logger.error("Failed to recover from revoked shared zone: \(error)")
         }
     }
 
-    private func requeueAllRecords() {
+    private func requeueRecords(forCollection collectionID: UUID?) {
         do {
-            try store.requeueAllRecords()
+            try store.requeueRecords(forCollection: collectionID)
             try store.save()
             reconcileOutbox()
         } catch {
@@ -664,7 +780,6 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         _ event: CKSyncEngine.Event.SentRecordZoneChanges,
         syncEngine: CKSyncEngine
     ) {
-        guard syncEngine === activeEngine else { return }
         var didChange = false
 
         for savedRecord in event.savedRecords {
@@ -798,24 +913,24 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         switch event.changeType {
         case .signIn:
             recordSuccessfulCloudKitActivity()
-            if role == .owner {
-                ensureOwnedZoneExists()
+            for zoneID in ownedZones {
+                ensureZoneExists(zoneID)
             }
             reconcileOutbox()
 
         case .switchAccounts:
             recordSuccessfulCloudKitActivity()
-            hasPreparedOwnedZone = false
+            preparedZones.removeAll()
             lastSyncError =
                 "The iCloud account changed. Local data is safe; \(configuration.appName) is preparing it for the new account."
-            if role == .owner {
-                ensureOwnedZoneExists()
-                requeueAllRecords()
+            for zoneID in ownedZones {
+                ensureZoneExists(zoneID)
             }
+            requeueRecords(forCollection: nil)
 
         case .signOut:
             availability = .signedOut
-            hasPreparedOwnedZone = false
+            preparedZones.removeAll()
             lastSyncError =
                 "Signed out of iCloud. \(configuration.appName) will keep saving on this device and resume syncing after sign-in."
 

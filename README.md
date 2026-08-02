@@ -11,18 +11,20 @@
 
 </div>
 
-`SwiftDataSync` connects an app-owned SwiftData store to a shared CloudKit record zone. SwiftData remains the durable local source of truth while `CKSyncEngine` delivers a transactionally maintained outbox to the owner's private database or a participant's shared database.
+`SwiftDataSync` connects an app-owned SwiftData store to any number of shared CloudKit record zones. SwiftData remains the durable local source of truth while `CKSyncEngine` delivers a transactionally maintained outbox to the owner's private database or a participant's shared database - one zone at a time, or many at once, side by side.
+
+A device can simultaneously own some zones (created by this device, tracked in its private database) and participate in others (shared here by someone else, tracked in the shared database). Each zone is optionally associated with an app-defined `collectionID` - an opaque identifier for whatever the app shares as a unit (a project, a workspace, a single record) - used only to route durable changes and fetched records to the right zone. The engine never interprets what a collection means.
 
 The package provides:
 
-- Private and shared `CKSyncEngine` routing
-- Owner and participant roles
-- Custom-zone creation and recovery
-- Zone-wide `CKShare` preparation
-- Persistent engine state
+- Private and shared `CKSyncEngine` routing across an arbitrary set of zones
+- Per-zone owner/participant roles, resolved independently
+- Custom-zone creation and recovery, per zone
+- Per-zone `CKShare` preparation, so preparing one zone's share never disturbs another's
+- Persistent engine state (zones, roles, and their collection associations)
 - Account availability monitoring
 - Retry classification
-- Conflict and revocation hooks
+- Conflict and revocation hooks, scoped to the one collection affected
 - CloudKit system-field helpers
 - A type-erased adapter for app-specific SwiftData models
 
@@ -63,12 +65,11 @@ Every consuming app still owns its CloudKit contract. Enable:
 
 Deploy the app's CloudKit schema before shipping.
 
-Create one configuration:
+Create one configuration. Unlike a single-zone setup, this doesn't carry a fixed zone name of its own - an app can track any number of zones side by side, each named however its own model needs:
 
 ```swift
 let configuration = SwiftDataSyncConfiguration(
   containerIdentifier: "iCloud.com.example.Tasks",
-  zoneName: "SharedWorkspace",
   appGroupIdentifier: "group.com.example.Tasks",
   stateKeyPrefix: "tasks.sync",
   shareTitle: "Shared tasks",
@@ -91,7 +92,7 @@ final class TaskCloudStore: SwiftDataSyncStore {
 }
 ```
 
-The outbox row should be inserted or updated in the same SwiftData transaction as the app model being changed. This guarantees that terminating the app between a local save and a network request cannot silently lose the upload.
+Every pending change's `collectionID` (on `SwiftDataSyncPendingChange`) tells the engine which zone it belongs to - the outbox row should be inserted or updated in the same SwiftData transaction as the app model being changed. This guarantees that terminating the app between a local save and a network request cannot silently lose the upload.
 
 Create and retain the engine:
 
@@ -102,32 +103,42 @@ let syncEngine = SwiftDataSyncEngine(
 )
 ```
 
+Provision a zone this device owns - safe to call repeatedly (e.g. once per owned zone at every launch):
+
+```swift
+let zoneID = configuration.ownedZoneID(named: "Workspace-\(workspaceID)")
+syncEngine.ensureZoneExists(zoneID, collectionID: workspaceID)
+```
+
 Call `reconcileOutbox()` after committing a local mutation. Call `fetchChangesNow()` for an explicit user-requested refresh.
 
 ## Sharing
 
-Prepare the owner's zone-wide share:
+Prepare a specific zone's zone-wide share:
 
 ```swift
 let sharing = SwiftDataSyncSharingCoordinator(syncManager: syncEngine)
-await sharing.prepareShare()
+await sharing.prepareShare(for: zoneID, title: "My workspace")
 ```
 
-Present `sharing.activeShare` with `UICloudSharingController`. Forward accepted share metadata from the app or scene delegate:
+Present `sharing.activeShare(for: zoneID)` with `UICloudSharingController`. Forward accepted share metadata from the app or scene delegate - pass the `collectionID` this zone belongs to, if the app can determine it (e.g. by encoding it in the zone's own name):
 
 ```swift
-syncEngine.adoptSharedZone(metadata.share.recordID.zoneID)
+syncEngine.adoptSharedZone(
+  metadata.share.recordID.zoneID,
+  collectionID: workspaceID
+)
 ```
 
-The owner always writes to a custom zone in their private database. CloudKit exposes that zone in each accepted participant's shared database; the package selects the correct database from the persisted role.
+The owner always writes to a custom zone in their private database. CloudKit exposes that zone in each accepted participant's shared database; the package selects the correct database per zone from that zone's own persisted role - a device can own some zones and participate in others at the same time. `syncEngine.role(for:)`, `.zoneID(forCollection:)`, and `.collectionID(for:)` let the app move between a zone and the collection it represents in either direction.
 
 ## Data-safety contract
 
 - Local SwiftData is authoritative.
 - Network delivery is eventually consistent.
 - Failed changes remain in the durable outbox.
-- A participant's private data is protected before adopting a share.
-- Revoked shares invoke the app's recovery hook instead of deleting local data.
+- A participant's private data is protected before adopting a share, scoped to the one collection being adopted - every other collection this device already owns or participates in is untouched.
+- A revoked share invokes the app's recovery hook for just that one collection instead of deleting local data.
 - CloudKit conflicts are passed to the app for explicit preservation and merge.
 
 ## CloudSyncKit

@@ -15,7 +15,9 @@ import Foundation
 @MainActor
 public protocol SwiftDataSyncStore: AnyObject {
 
-    /// Returns durable changes belonging to the currently active shared collection.
+    /// Returns durable changes across every collection this device tracks —
+    /// each change's `collectionID` is how the engine routes it to the right
+    /// zone, not an implicit single active one.
     func pendingChanges() throws -> [SwiftDataSyncPendingChange]
 
     /// Records that an upload or deletion has been attempted.
@@ -36,8 +38,14 @@ public protocol SwiftDataSyncStore: AnyObject {
         in zoneID: CKRecordZone.ID
     ) throws -> CKRecord?
 
-    /// Archives or otherwise protects local data before adopting somebody else's share.
-    func prepareToAdoptShare() throws
+    /// Archives or otherwise protects local data before adopting somebody else's
+    /// share for the given collection, if that collection needs any local
+    /// preparation at all — unlike a single-zone engine, adopting one shared
+    /// collection must not disturb any other collection this device already
+    /// owns or participates in.
+    ///
+    /// - Parameter collectionID: The collection being adopted, when known.
+    func prepareToAdoptShare(collectionID: UUID?) throws
 
     /// Applies fetched records and deletions to the local SwiftData source of truth.
     ///
@@ -74,11 +82,19 @@ public protocol SwiftDataSyncStore: AnyObject {
         category: String
     ) throws
 
-    /// Replaces a revoked participant collection with a safe new local collection.
-    func recoverFromRevokedShare() throws
+    /// Replaces a revoked participant collection with a safe new local
+    /// collection. Scoped to the one collection whose zone was revoked —
+    /// every other collection this device tracks is untouched.
+    ///
+    /// - Parameter collectionID: The collection whose share was revoked, when known.
+    func recoverFromRevokedShare(collectionID: UUID?) throws
 
-    /// Requeues the active local collection after its owner zone is recreated.
-    func requeueAllRecords() throws
+    /// Requeues records after their owner zone is recreated.
+    ///
+    /// - Parameter collectionID: The collection to requeue, or `nil` to requeue
+    ///   every collection this device owns (used when the scope of a reset
+    ///   can't be narrowed to one zone).
+    func requeueRecords(forCollection collectionID: UUID?) throws
 
     /// Saves pending adapter changes.
     func save() throws
