@@ -15,7 +15,6 @@ struct SwiftDataSyncTests {
 
     private let configuration = SwiftDataSyncConfiguration(
         containerIdentifier: "iCloud.com.example.Example",
-        zoneName: "SharedWorkspace",
         appGroupIdentifier: "group.com.example.Example",
         stateKeyPrefix: "example.sync",
         shareTitle: "Example workspace",
@@ -27,7 +26,7 @@ struct SwiftDataSyncTests {
     func stableRecordIdentity() {
         let id = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
         let participantZone = CKRecordZone.ID(
-            zoneName: configuration.zoneName,
+            zoneName: "SharedWorkspace",
             ownerName: "owner"
         )
 
@@ -40,12 +39,11 @@ struct SwiftDataSyncTests {
         #expect(recordID.zoneID == participantZone)
     }
 
-    @Test("Owned zones use the configured name")
+    @Test("Owned zones use the given name")
     func ownedZoneIdentity() {
-        #expect(configuration.ownedZoneID.zoneName == "SharedWorkspace")
-        #expect(
-            configuration.ownedZoneID.ownerName == CKCurrentUserDefaultName
-        )
+        let zoneID = configuration.ownedZoneID(named: "SharedWorkspace")
+        #expect(zoneID.zoneName == "SharedWorkspace")
+        #expect(zoneID.ownerName == CKCurrentUserDefaultName)
     }
 
     @Test(
