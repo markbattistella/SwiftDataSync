@@ -265,6 +265,29 @@ public final class SwiftDataSyncEngine {
 
     #endif
 
+    /// Clears every persisted zone-tracking and CloudKit sync-token record
+    /// for this engine — for recovering when that bookkeeping itself became
+    /// wrong or stale (e.g. after an interrupted schema migration left zones
+    /// registered under the wrong identity). Local SwiftData data is
+    /// completely untouched.
+    ///
+    /// Takes effect from the next app launch: the `SwiftDataSyncEngine`
+    /// constructed then starts with no known zones and no CloudKit change
+    /// tokens, so the app's own bootstrap step re-derives zone identity
+    /// fresh from its current local models, and the following fetch pulls
+    /// each rediscovered zone's complete current state from CloudKit rather
+    /// than "since last checkpoint" — safe to call on a live engine, but it
+    /// has no effect on this session's already-running `CKSyncEngine`s.
+    public func resetPersistedState() {
+        stateStore.removeValue(forKey: zonesKey)
+        stateStore.removeValue(forKey: privateStateKey)
+        stateStore.removeValue(forKey: sharedStateKey)
+        ownedZones = []
+        sharedZones = []
+        zoneByCollection = [:]
+        preparedZones = []
+    }
+
     /// Fetches remote changes across every tracked zone after first
     /// reconciling durable local changes.
     public func fetchChangesNow() {
