@@ -18,13 +18,13 @@ public enum SwiftDataSyncRetryPolicy {
     ///   as a permission or schema rejection.
     public static func shouldRetry(_ code: CKError.Code) -> Bool {
         switch code {
-        case .networkFailure, .networkUnavailable, .zoneBusy,
-            .serviceUnavailable, .notAuthenticated, .operationCancelled,
-            .requestRateLimited, .resultsTruncated,
-            .accountTemporarilyUnavailable:
-            true
-        default:
-            false
+            case .networkFailure, .networkUnavailable, .zoneBusy,
+                .serviceUnavailable, .notAuthenticated, .operationCancelled,
+                .requestRateLimited, .resultsTruncated,
+                .accountTemporarilyUnavailable:
+                true
+            default:
+                false
         }
     }
 }

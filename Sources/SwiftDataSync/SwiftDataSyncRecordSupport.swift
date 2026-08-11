@@ -59,16 +59,16 @@ public enum SwiftDataSyncRecordSupport {
         for key in record.allKeys().sorted() {
             let value = record[key]
             switch value {
-            case let date as Date:
-                values[key] = date.ISO8601Format()
-            case let data as Data:
-                values[key] = data.base64EncodedString()
-            case let strings as [String]:
-                values[key] = strings.joined(separator: ",")
-            case let value?:
-                values[key] = String(describing: value)
-            case nil:
-                values[key] = "nil"
+                case let date as Date:
+                    values[key] = date.ISO8601Format()
+                case let data as Data:
+                    values[key] = data.base64EncodedString()
+                case let strings as [String]:
+                    values[key] = strings.joined(separator: ",")
+                case let value?:
+                    values[key] = String(describing: value)
+                case nil:
+                    values[key] = "nil"
             }
         }
 

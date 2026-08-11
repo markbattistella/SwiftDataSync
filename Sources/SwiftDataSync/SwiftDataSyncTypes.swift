@@ -42,10 +42,10 @@ public enum SwiftDataSyncAvailability: Equatable, Sendable {
     /// resolves itself, so it doesn't warrant a notice.
     public var requiresLocalDataNotice: Bool {
         switch self {
-        case .signedOut, .restricted:
-            true
-        case .checking, .available, .temporarilyUnavailable:
-            false
+            case .signedOut, .restricted:
+                true
+            case .checking, .available, .temporarilyUnavailable:
+                false
         }
     }
 
