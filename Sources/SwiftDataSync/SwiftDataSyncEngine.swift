@@ -290,26 +290,41 @@ public final class SwiftDataSyncEngine {
 
     /// Fetches remote changes across every tracked zone after first
     /// reconciling durable local changes.
+    ///
+    /// Detached for the same reason as `sendChanges(using:)`: a plain `Task`
+    /// inherits this type's `@MainActor` context and is queued behind whatever
+    /// main-actor work is in flight. When a `CKSyncEngine` delegate callback
+    /// suspends, such a task resumes *inside* it, and awaiting `fetchChanges()`
+    /// there re-enters the engine from its own delegate - a fatal client bug
+    /// as far as CloudKit is concerned, not a recoverable error.
+    ///
+    /// The main-actor work is hopped back onto explicitly, so only the two
+    /// engine awaits actually run off it.
     public func fetchChangesNow() {
-        Task { [weak self] in
+        Task.detached { [weak self] in
             guard let self else { return }
             await refreshAccountStatus()
-            guard availability == .available else { return }
-            for zoneID in ownedZones {
-                ensureZoneExists(zoneID)
+
+            let zones = await MainActor.run { () -> (owned: Bool, shared: Bool)? in
+                guard self.availability == .available else { return nil }
+                for zoneID in self.ownedZones {
+                    self.ensureZoneExists(zoneID)
+                }
+                self.reconcileOutbox()
+                return (!self.ownedZones.isEmpty, !self.sharedZones.isEmpty)
             }
-            reconcileOutbox()
+            guard let zones else { return }
 
             do {
-                if !ownedZones.isEmpty {
+                if zones.owned {
                     try await privateEngine.fetchChanges()
                 }
-                if !sharedZones.isEmpty {
+                if zones.shared {
                     try await sharedEngine.fetchChanges()
                 }
-                recordSuccessfulCloudKitActivity()
+                await recordSuccessfulCloudKitActivity()
             } catch {
-                recordTransientSyncFailure(error)
+                await recordTransientSyncFailure(error)
             }
         }
     }
@@ -416,14 +431,17 @@ public final class SwiftDataSyncEngine {
         }
         persistZones()
 
-        Task { [weak self] in
+        // Detached for the same reason as `fetchChangesNow()` - accepting a
+        // share can happen while the engine is mid-callback, and awaiting
+        // `fetchChanges()` from a main-actor task would re-enter it.
+        Task.detached { [weak self] in
             guard let self else { return }
             do {
                 try await sharedEngine.fetchChanges()
-                recordSuccessfulCloudKitActivity()
-                reconcileOutbox()
+                await recordSuccessfulCloudKitActivity()
+                await reconcileOutbox()
             } catch {
-                recordTransientSyncFailure(error)
+                await recordTransientSyncFailure(error)
             }
         }
     }
@@ -530,12 +548,29 @@ public final class SwiftDataSyncEngine {
         }
     }
 
+    /// Sends queued changes without re-entering the engine from its own
+    /// delegate.
+    ///
+    /// `Task` is not enough here. This type is `@MainActor`, so a plain `Task`
+    /// inherits that context and is queued behind whatever main-actor work is
+    /// already running — including a `CKSyncEngine` delegate callback that has
+    /// suspended. `ensureZoneExists` and `reconcileOutbox` both call this from
+    /// inside such callbacks, so the send lands *within* the callback, and
+    /// CKSyncEngine treats re-entering itself from its own delegate as a fatal
+    /// client bug rather than a recoverable error:
+    ///
+    ///     BUG IN CLIENT OF CLOUDKIT: Cannot await a call into CKSyncEngine
+    ///     from within a delegate callback… Try performing this in a detached
+    ///     Task.
+    ///
+    /// `Task.detached` is that advice: it inherits no actor context, so the
+    /// send runs off the main actor and outside any callback in flight.
     private func sendChanges(using engine: CKSyncEngine) {
-        Task { [weak self] in
+        Task.detached { [weak self] in
             do {
                 try await engine.sendChanges()
             } catch {
-                self?.recordTransientSyncFailure(error)
+                await self?.recordTransientSyncFailure(error)
             }
         }
     }
