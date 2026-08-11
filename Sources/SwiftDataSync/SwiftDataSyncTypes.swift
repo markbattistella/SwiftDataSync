@@ -6,7 +6,9 @@
 
 import Foundation
 
-/// The device's relationship to the active CloudKit shared zone.
+/// The device's relationship to a tracked CloudKit zone.
+///
+/// A device can hold both roles at once, for different zones.
 public enum SwiftDataSyncRole: String, Codable, Sendable {
 
     /// This user owns the custom zone in their private database.
@@ -16,10 +18,10 @@ public enum SwiftDataSyncRole: String, Codable, Sendable {
     case participant
 }
 
-/// The current availability of the configured iCloud account.
+/// The availability of the configured iCloud account.
 public enum SwiftDataSyncAvailability: Equatable, Sendable {
 
-    /// The initial account check has not completed.
+    /// The initial account check hasn't completed.
     case checking
 
     /// CloudKit has confirmed successful account access.
@@ -31,10 +33,13 @@ public enum SwiftDataSyncAvailability: Equatable, Sendable {
     /// System policy restricts this device's iCloud access.
     case restricted
 
-    /// CloudKit could not determine availability and will be retried.
+    /// CloudKit couldn't determine availability and will retry.
     case temporarilyUnavailable
 
     /// Whether the app should explain that data is currently device-local.
+    ///
+    /// `true` only for states the person can act on. A temporary outage
+    /// resolves itself, so it doesn't warrant a notice.
     public var requiresLocalDataNotice: Bool {
         switch self {
         case .signedOut, .restricted:
@@ -44,7 +49,8 @@ public enum SwiftDataSyncAvailability: Equatable, Sendable {
         }
     }
 
-    /// Backwards-compatible terminology for journal-style apps.
+    /// An alias of ``requiresLocalDataNotice`` kept for journal-style apps
+    /// that adopted the earlier name.
     public var requiresLocalJournalNotice: Bool {
         requiresLocalDataNotice
     }
@@ -61,6 +67,9 @@ public enum SwiftDataSyncMutation: String, Codable, Sendable {
 }
 
 /// A type-erased durable change supplied by an app's SwiftData store.
+///
+/// This is the only shape in which outbox rows cross the package boundary,
+/// which keeps `ModelContext` and its models on the main actor.
 public struct SwiftDataSyncPendingChange: Hashable, Sendable {
 
     /// The stable local identity used as the CloudKit record name.
@@ -69,7 +78,7 @@ public struct SwiftDataSyncPendingChange: Hashable, Sendable {
     /// The app-defined record-type identifier.
     public let recordType: String
 
-    /// The optional shared-collection identity used for local scoping.
+    /// The collection this change belongs to, used to route it to a zone.
     public let collectionID: UUID?
 
     /// The operation CloudKit needs to perform.
@@ -80,7 +89,8 @@ public struct SwiftDataSyncPendingChange: Hashable, Sendable {
     /// - Parameters:
     ///   - recordID: The stable local identity.
     ///   - recordType: The app-defined record-type identifier.
-    ///   - collectionID: The optional shared-collection identity.
+    ///   - collectionID: The collection this change belongs to. A change with
+    ///     no collection stays in the outbox until one can be resolved.
     ///   - mutation: The operation CloudKit needs to perform.
     public init(
         recordID: UUID,

@@ -8,13 +8,18 @@ import CloudKit
 import Foundation
 import Observation
 
-/// Creates or retrieves the zone-wide share for any zone an app's sync
-/// engine owns — one share per zone, tracked independently, so preparing
-/// one zone's share never clobbers another's in-flight state.
+/// Creates or retrieves the zone-wide share for any zone an app's sync engine
+/// owns.
+///
+/// State is tracked per zone, so preparing one zone's share never clobbers
+/// another's in-flight state. Each zone has at most one share.
+///
+/// - Important: Main-actor isolated, matching the engine it coordinates.
 @MainActor
 @Observable
 public final class SwiftDataSyncSharingCoordinator {
 
+    /// The engine whose owned zones this coordinator can share.
     private let syncManager: SwiftDataSyncEngine
 
     /// The prepared shares ready for `UICloudSharingController`, keyed by zone.
@@ -23,7 +28,7 @@ public final class SwiftDataSyncSharingCoordinator {
     /// Zones whose share is currently being fetched or created.
     public private(set) var preparingZones: Set<CKRecordZone.ID> = []
 
-    /// Plain-language descriptions of a share preparation failure, keyed by zone.
+    /// Plain-language share-preparation failures, keyed by zone.
     public private(set) var shareErrors: [CKRecordZone.ID: String] = [:]
 
     /// Creates a coordinator for an existing sync engine.
@@ -33,30 +38,45 @@ public final class SwiftDataSyncSharingCoordinator {
         self.syncManager = syncManager
     }
 
-    /// The prepared share for a zone, if one has been fetched or created.
+    /// Returns the prepared share for a zone.
+    ///
+    /// - Parameter zoneID: The zone to look up.
+    /// - Returns: The share, or `nil` when none has been prepared.
     public func activeShare(for zoneID: CKRecordZone.ID) -> CKShare? {
         activeShares[zoneID]
     }
 
-    /// Whether a zone's share is currently being fetched or created.
+    /// Returns whether a zone's share is currently being fetched or created.
+    ///
+    /// - Parameter zoneID: The zone to look up.
+    /// - Returns: `true` while preparation is in flight.
     public func isPreparingShare(for zoneID: CKRecordZone.ID) -> Bool {
         preparingZones.contains(zoneID)
     }
 
-    /// The most recent share preparation failure for a zone, if any.
+    /// Returns the most recent share-preparation failure for a zone.
+    ///
+    /// - Parameter zoneID: The zone to look up.
+    /// - Returns: A plain-language description, or `nil` when the last attempt
+    ///   succeeded or none has been made.
     public func shareError(for zoneID: CKRecordZone.ID) -> String? {
         shareErrors[zoneID]
     }
 
-    /// Fetches the existing zone-wide share for `zoneID` or creates it on
-    /// first use.
+    /// Fetches a zone's existing zone-wide share, or creates it on first use.
+    ///
+    /// On success the share is published in ``activeShares`` and available
+    /// from ``activeShare(for:)``, ready to hand to the system sharing
+    /// interface. Failures are reported through ``shareError(for:)`` rather
+    /// than thrown, including an attempt to share a zone this device doesn't
+    /// own.
     ///
     /// - Parameters:
-    ///   - zoneID: The owned zone to share. Must belong to this device
-    ///     (`syncManager.role(for: zoneID) == .owner`).
-    ///   - title: The title shown by the system sharing interface, overriding
-    ///     `configuration.shareTitle` — typically the specific thing being
-    ///     shared (e.g. a baby's name) rather than the app-wide default.
+    ///   - zoneID: The zone to share. Must be owned by this device, meaning
+    ///     ``SwiftDataSyncEngine/role(for:)`` returns `.owner`.
+    ///   - title: The title shown by the system sharing interface, typically
+    ///     naming the specific thing being shared. Pass `nil` to use the
+    ///     configuration's ``SwiftDataSyncConfiguration/shareTitle``.
     public func prepareShare(for zoneID: CKRecordZone.ID, title: String? = nil) async {
         guard syncManager.role(for: zoneID) == .owner else {
             shareErrors[zoneID] = "Only the shared data's owner can invite someone else."

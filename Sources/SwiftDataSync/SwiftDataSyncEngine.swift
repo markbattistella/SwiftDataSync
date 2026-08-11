@@ -11,21 +11,24 @@ import SimpleLogger
 
 private let logger = SimpleLogger(category: .sync)
 
-/// Mirrors a set of custom CloudKit zones while an app's SwiftData adapter
-/// remains the durable local source of truth.
+/// Mirrors an app's SwiftData store into a set of custom CloudKit zones.
 ///
 /// The engine owns CloudKit transport, zone tracking, state persistence,
-/// retries, zone recovery, and private/shared database routing — for
-/// however many zones the app is tracking at once, not just one. A device
-/// can simultaneously own some zones (created by this device, tracked in
-/// the private database) and participate in others (shared here by someone
-/// else, tracked in the shared database); both engines run concurrently
-/// rather than switching between a single "active" one.
+/// retries, zone recovery, and routing between the private and shared
+/// databases. The app's ``SwiftDataSyncStore`` adapter remains the durable
+/// local source of truth.
 ///
-/// Each zone is optionally associated with an app-defined `collectionID` —
-/// an opaque identifier (e.g. one per shareable unit in the app's own
-/// model) used only to route durable changes and fetched records to the
-/// right zone. The engine never interprets what a collection *means*.
+/// A device can own zones and participate in zones shared to it by other
+/// people at the same time. Both databases sync concurrently rather than the
+/// engine switching between a single active zone.
+///
+/// Each zone may be associated with an app-defined `collectionID`: an opaque
+/// identifier, typically one per shareable unit in the app's own model, used
+/// only to route durable changes and fetched records to the correct zone. The
+/// engine never interprets what a collection represents.
+///
+/// - Important: The engine is main-actor isolated because `ModelContext` and
+///   its models must not cross actor boundaries.
 @MainActor
 @Observable
 public final class SwiftDataSyncEngine {
@@ -33,7 +36,7 @@ public final class SwiftDataSyncEngine {
     /// The device's relationship to a tracked zone.
     public typealias Role = SwiftDataSyncRole
 
-    /// The current availability of the configured iCloud account.
+    /// The availability of the configured iCloud account.
     public typealias Availability = SwiftDataSyncAvailability
 
     /// The CloudKit and presentation configuration for this engine.
@@ -45,24 +48,35 @@ public final class SwiftDataSyncEngine {
     /// Zones shared to this device by someone else, tracked in the shared database.
     public private(set) var sharedZones: Set<CKRecordZone.ID> = []
 
-    /// A plain-language explanation of the most recent sync failure.
+    /// A plain-language description of the most recent sync failure.
     public private(set) var lastSyncError: String?
 
-    /// The most recent time a complete fetch or send finished successfully.
+    /// The raw `CKError.Code` name for the change CloudKit last refused.
+    ///
+    /// Intended for support and diagnostics. ``lastSyncError`` is deliberately
+    /// plain language, so every rejection reads alike from the outside; this
+    /// keeps the underlying reason available without Console.app.
+    public private(set) var lastRejectionReason: String?
+
+    /// The time the most recent complete fetch or send succeeded.
     public private(set) var lastSyncedAt: Date?
 
-    /// The current availability of the configured iCloud account.
+    /// The availability of the configured iCloud account.
     public private(set) var availability: Availability = .checking
 
+    /// The CloudKit container described by the configuration.
     @ObservationIgnored
     private let container: CKContainer
 
+    /// The app's adapter for SwiftData models and outbox rows.
     @ObservationIgnored
     private let store: any SwiftDataSyncStore
 
+    /// Persistence for zone tracking and opaque `CKSyncEngine` state.
     @ObservationIgnored
     private let stateStore: any SwiftDataSyncStateStore
 
+    /// The sync engine for zones this device owns.
     @ObservationIgnored
     private lazy var privateEngine = CKSyncEngine(
         makeEngineConfiguration(
@@ -71,6 +85,7 @@ public final class SwiftDataSyncEngine {
         )
     )
 
+    /// The sync engine for zones shared to this device.
     @ObservationIgnored
     private lazy var sharedEngine = CKSyncEngine(
         makeEngineConfiguration(
@@ -79,30 +94,43 @@ public final class SwiftDataSyncEngine {
         )
     )
 
+    /// The task observing `CKAccountChanged` for this container.
     @ObservationIgnored
     private var accountChangeTask: Task<Void, Never>?
 
-    /// Both directions of the zone ↔ collection association, kept in sync —
-    /// a handful of zones per device at most, so a plain dictionary plus a
-    /// linear reverse lookup is simpler than a bidirectional map type.
+    /// The zone each app-defined collection routes to.
+    ///
+    /// A device tracks a handful of zones at most, so a plain dictionary with
+    /// a linear reverse lookup is simpler than a bidirectional map.
     private var zoneByCollection: [UUID: CKRecordZone.ID] = [:]
 
-    /// Zones whose `.saveZone` has been sent this session — reset on relaunch,
-    /// same as the original single-zone engine's `hasPreparedOwnedZone`, so a
-    /// zone that never confirmed before termination is resent harmlessly.
+    /// Zones whose `.saveZone` has been sent this session.
+    ///
+    /// Reset on relaunch, so a zone that never confirmed creation before
+    /// termination is resent harmlessly.
     private var preparedZones: Set<CKRecordZone.ID> = []
 
+    /// Whether any zone failed during the fetch currently in flight.
     private var activeFetchHadError = false
+
+    /// Whether any change failed during the send currently in flight.
     private var activeSendHadError = false
+
+    /// A monotonic token used to discard out-of-order account checks.
     private var accountStatusRequestID: UInt = 0
 
     /// Creates an engine connected to an app's SwiftData-backed store.
     ///
+    /// Zones tracked by a previous session are restored before the engine
+    /// contacts CloudKit.
+    ///
     /// - Parameters:
     ///   - configuration: CloudKit identifiers and user-facing terminology.
     ///   - store: The adapter for app-specific SwiftData models and outbox rows.
-    ///   - startsAutomatically: Whether to check the account and reconcile at launch.
-    ///   - stateStore: An optional custom store for opaque engine state.
+    ///   - startsAutomatically: Whether to check the account and reconcile at
+    ///     launch. Pass `false` to drive the engine manually, such as in tests.
+    ///   - stateStore: A custom store for opaque engine state, or `nil` to
+    ///     persist in `UserDefaults`.
     public init(
         configuration: SwiftDataSyncConfiguration,
         store: any SwiftDataSyncStore,
@@ -164,26 +192,38 @@ public final class SwiftDataSyncEngine {
         accountChangeTask?.cancel()
     }
 
-    /// The collection identifier associated with a tracked zone, if any.
+    /// Returns the collection identifier a tracked zone routes for.
+    ///
+    /// - Parameter zoneID: The zone to look up.
+    /// - Returns: The associated collection identifier, or `nil` when the zone
+    ///   has none.
     public func collectionID(for zoneID: CKRecordZone.ID) -> UUID? {
         zoneByCollection.first { $0.value == zoneID }?.key
     }
 
-    /// The zone associated with a collection identifier, if this device
-    /// owns or participates in one for it.
+    /// Returns the zone a collection identifier routes to.
+    ///
+    /// - Parameter collectionID: The app-defined collection identifier.
+    /// - Returns: The associated zone, or `nil` when this device neither owns
+    ///   nor participates in one for that collection.
     public func zoneID(forCollection collectionID: UUID) -> CKRecordZone.ID? {
         zoneByCollection[collectionID]
     }
 
-    /// This device's relationship to a tracked zone. `nil` if the zone
-    /// isn't tracked at all.
+    /// Returns this device's relationship to a tracked zone.
+    ///
+    /// - Parameter zoneID: The zone to look up.
+    /// - Returns: The device's role, or `nil` when the zone isn't tracked.
     public func role(for zoneID: CKRecordZone.ID) -> Role? {
         if ownedZones.contains(zoneID) { return .owner }
         if sharedZones.contains(zoneID) { return .participant }
         return nil
     }
 
-    /// Refreshes the configured CloudKit account's availability.
+    /// Refreshes ``availability`` from the configured CloudKit account.
+    ///
+    /// Overlapping calls are tolerated: only the most recent one is allowed to
+    /// publish its result.
     public func refreshAccountStatus() async {
         accountStatusRequestID &+= 1
         let requestID = accountStatusRequestID
@@ -225,7 +265,11 @@ public final class SwiftDataSyncEngine {
         }
     }
 
-    /// Records stronger evidence of availability than a potentially stale account check.
+    /// Marks the account as available and clears ``lastSyncError``.
+    ///
+    /// A completed CloudKit operation is stronger evidence of availability
+    /// than a possibly stale account check, so calling this also invalidates
+    /// any account check still in flight.
     public func recordSuccessfulCloudKitActivity() {
         accountStatusRequestID &+= 1
         availability = .available
@@ -241,6 +285,8 @@ public final class SwiftDataSyncEngine {
     ///   - ownedCollectionID: The collection `ownedZoneID` routes for, if any.
     ///   - sharedZoneID: A zone to preview as shared to this device, if any.
     ///   - sharedCollectionID: The collection `sharedZoneID` routes for, if any.
+    ///   - availability: The account availability to present.
+    ///   - lastSyncedAt: The last successful sync time to present, if any.
     public func configureForPreview(
         ownedZoneID: CKRecordZone.ID? = nil,
         ownedCollectionID: UUID? = nil,
@@ -265,19 +311,21 @@ public final class SwiftDataSyncEngine {
 
     #endif
 
-    /// Clears every persisted zone-tracking and CloudKit sync-token record
-    /// for this engine — for recovering when that bookkeeping itself became
-    /// wrong or stale (e.g. after an interrupted schema migration left zones
-    /// registered under the wrong identity). Local SwiftData data is
-    /// completely untouched.
+    /// Clears every persisted zone-tracking and CloudKit sync-token record for
+    /// this engine, leaving local SwiftData data untouched.
     ///
-    /// Takes effect from the next app launch: the `SwiftDataSyncEngine`
-    /// constructed then starts with no known zones and no CloudKit change
-    /// tokens, so the app's own bootstrap step re-derives zone identity
-    /// fresh from its current local models, and the following fetch pulls
-    /// each rediscovered zone's complete current state from CloudKit rather
-    /// than "since last checkpoint" — safe to call on a live engine, but it
-    /// has no effect on this session's already-running `CKSyncEngine`s.
+    /// Use this to recover when the bookkeeping itself has become wrong or
+    /// stale, such as after an interrupted schema migration left zones
+    /// registered under the wrong identity.
+    ///
+    /// The reset takes effect at the next launch. The engine constructed then
+    /// starts with no known zones and no change tokens, so the app's own
+    /// bootstrap step re-derives zone identity from its current local models,
+    /// and the following fetch pulls each rediscovered zone's complete state
+    /// rather than changes since the last checkpoint.
+    ///
+    /// - Note: Safe to call on a live engine, but it has no effect on the
+    ///   `CKSyncEngine` instances already running in this session.
     public func resetPersistedState() {
         stateStore.removeValue(forKey: zonesKey)
         stateStore.removeValue(forKey: privateStateKey)
@@ -288,18 +336,16 @@ public final class SwiftDataSyncEngine {
         preparedZones = []
     }
 
-    /// Fetches remote changes across every tracked zone after first
+    /// Fetches remote changes across every tracked zone, after first
     /// reconciling durable local changes.
     ///
-    /// Detached for the same reason as `sendChanges(using:)`: a plain `Task`
-    /// inherits this type's `@MainActor` context and is queued behind whatever
-    /// main-actor work is in flight. When a `CKSyncEngine` delegate callback
-    /// suspends, such a task resumes *inside* it, and awaiting `fetchChanges()`
-    /// there re-enters the engine from its own delegate - a fatal client bug
-    /// as far as CloudKit is concerned, not a recoverable error.
-    ///
-    /// The main-actor work is hopped back onto explicitly, so only the two
-    /// engine awaits actually run off it.
+    /// Returns immediately; the fetch proceeds in a detached task for the same
+    /// reason as `sendChanges(using:)`. A task inheriting this type's
+    /// main-actor isolation can resume inside a suspended `CKSyncEngine`
+    /// delegate callback, and awaiting `fetchChanges()` there re-enters the
+    /// engine from its own delegate — which CloudKit treats as a fatal client
+    /// bug rather than a recoverable error. Main-actor work is hopped back
+    /// onto explicitly, so only the two engine awaits run off it.
     public func fetchChangesNow() {
         Task.detached { [weak self] in
             guard let self else { return }
@@ -331,8 +377,9 @@ public final class SwiftDataSyncEngine {
 
     /// Rehydrates the engine's pending changes from the adapter's durable
     /// outbox, routing each one to the zone its `collectionID` maps to.
-    /// Changes whose collection isn't tracked by any zone yet are left in
-    /// the outbox untouched rather than guessed into the wrong zone.
+    ///
+    /// Changes whose collection isn't tracked by any zone yet are left in the
+    /// outbox untouched rather than guessed into the wrong zone.
     public func reconcileOutbox() {
         do {
             let changes = try store.pendingChanges()
@@ -380,15 +427,17 @@ public final class SwiftDataSyncEngine {
         }
     }
 
-    /// Registers a zone this device owns — creating it in CloudKit if it
-    /// doesn't already exist there. Safe to call repeatedly (e.g. once per
-    /// owned zone at every launch, to re-verify a zone that never confirmed
-    /// creation before the app last terminated) — a zone already tracked
-    /// and already confirmed this session is a no-op.
+    /// Registers a zone this device owns, creating it in CloudKit if it
+    /// doesn't already exist there.
+    ///
+    /// Safe to call repeatedly — for example once per owned zone at every
+    /// launch, to re-verify a zone that never confirmed creation before the
+    /// app last terminated. A zone already tracked and already confirmed this
+    /// session is a no-op.
     ///
     /// - Parameters:
-    ///   - zoneID: The zone to create/verify in the owner's private database.
-    ///   - collectionID: The app-defined identifier this zone belongs to, if any.
+    ///   - zoneID: The zone to create or verify in the owner's private database.
+    ///   - collectionID: The app-defined identifier this zone routes for, if any.
     public func ensureZoneExists(_ zoneID: CKRecordZone.ID, collectionID: UUID? = nil) {
         let isNewZone = ownedZones.insert(zoneID).inserted
         if let collectionID {
@@ -406,13 +455,16 @@ public final class SwiftDataSyncEngine {
         sendChanges(using: privateEngine)
     }
 
-    /// Adopts a zone someone else shared to this device, alongside whatever
-    /// other zones this device already owns or participates in — accepting
-    /// one shared collection never disturbs any other.
+    /// Adopts a zone someone else shared to this device, alongside any zones
+    /// it already owns or participates in.
+    ///
+    /// Accepting one shared collection never disturbs another. The adapter is
+    /// given a chance to protect existing local data first; if that fails, the
+    /// zone isn't adopted and no local data is deleted.
     ///
     /// - Parameters:
     ///   - zoneID: The accepted zone in the participant's shared database.
-    ///   - collectionID: The app-defined identifier this zone belongs to, if any.
+    ///   - collectionID: The app-defined identifier this zone routes for, if any.
     public func adoptSharedZone(_ zoneID: CKRecordZone.ID, collectionID: UUID? = nil) {
         do {
             try store.prepareToAdoptShare(collectionID: collectionID)
@@ -431,7 +483,7 @@ public final class SwiftDataSyncEngine {
         }
         persistZones()
 
-        // Detached for the same reason as `fetchChangesNow()` - accepting a
+        // Detached for the same reason as `fetchChangesNow()`: accepting a
         // share can happen while the engine is mid-callback, and awaiting
         // `fetchChanges()` from a main-actor task would re-enter it.
         Task.detached { [weak self] in
@@ -446,22 +498,30 @@ public final class SwiftDataSyncEngine {
         }
     }
 
+    /// The state-store key for the private engine's serialized state.
     private var privateStateKey: String {
         "\(configuration.stateKeyPrefix).state.private"
     }
 
+    /// The state-store key for the shared engine's serialized state.
     private var sharedStateKey: String {
         "\(configuration.stateKeyPrefix).state.shared"
     }
 
+    /// The state-store key for the tracked-zone manifest.
     private var zonesKey: String {
         "\(configuration.stateKeyPrefix).zones"
     }
 
+    /// Returns the engine responsible for a zone's database.
+    ///
+    /// - Parameter zoneID: The zone to route.
+    /// - Returns: The private engine for owned zones, otherwise the shared one.
     private func engine(for zoneID: CKRecordZone.ID) -> CKSyncEngine {
         ownedZones.contains(zoneID) ? privateEngine : sharedEngine
     }
 
+    /// A tracked zone in its persisted form.
     private struct PersistedZone: Codable {
         let zoneName: String
         let ownerName: String
@@ -469,6 +529,15 @@ public final class SwiftDataSyncEngine {
         let role: SwiftDataSyncRole
     }
 
+    /// Restores the tracked-zone manifest written by a previous session.
+    ///
+    /// Static so it can run before `self` is fully initialized.
+    ///
+    /// - Parameters:
+    ///   - stateStore: The store holding the manifest.
+    ///   - key: The manifest's key.
+    /// - Returns: The persisted zones, or an empty array when absent or
+    ///   undecodable.
     private static func loadPersistedZones(
         from stateStore: any SwiftDataSyncStateStore,
         key: String
@@ -482,6 +551,7 @@ public final class SwiftDataSyncEngine {
         }
     }
 
+    /// Writes the current owned and shared zones to the state store.
     private func persistZones() {
         let owned = ownedZones.map { zoneID in
             PersistedZone(
@@ -506,6 +576,12 @@ public final class SwiftDataSyncEngine {
         }
     }
 
+    /// Builds a `CKSyncEngine` configuration bound to one database.
+    ///
+    /// - Parameters:
+    ///   - database: The private or shared database to sync.
+    ///   - stateKey: The key holding that database's serialized engine state.
+    /// - Returns: A configuration restoring any previously persisted state.
     private func makeEngineConfiguration(
         database: CKDatabase,
         stateKey: String
@@ -519,6 +595,11 @@ public final class SwiftDataSyncEngine {
         return engineConfiguration
     }
 
+    /// Restores a persisted `CKSyncEngine` state serialization.
+    ///
+    /// - Parameter key: The state-store key to read.
+    /// - Returns: The stored state, or `nil` when absent or undecodable, which
+    ///   makes the engine resync from scratch.
     private func loadState(
         forKey key: String
     ) -> CKSyncEngine.State.Serialization? {
@@ -534,6 +615,11 @@ public final class SwiftDataSyncEngine {
         }
     }
 
+    /// Persists a `CKSyncEngine` state serialization.
+    ///
+    /// - Parameters:
+    ///   - serialization: The state CloudKit asked to have stored.
+    ///   - key: The state-store key to write.
     private func saveState(
         _ serialization: CKSyncEngine.State.Serialization,
         forKey key: String
@@ -551,13 +637,13 @@ public final class SwiftDataSyncEngine {
     /// Sends queued changes without re-entering the engine from its own
     /// delegate.
     ///
-    /// `Task` is not enough here. This type is `@MainActor`, so a plain `Task`
-    /// inherits that context and is queued behind whatever main-actor work is
-    /// already running — including a `CKSyncEngine` delegate callback that has
-    /// suspended. `ensureZoneExists` and `reconcileOutbox` both call this from
-    /// inside such callbacks, so the send lands *within* the callback, and
-    /// CKSyncEngine treats re-entering itself from its own delegate as a fatal
-    /// client bug rather than a recoverable error:
+    /// A plain `Task` is not sufficient. This type is main-actor isolated, so
+    /// a plain `Task` inherits that context and is queued behind whatever
+    /// main-actor work is already running — including a suspended
+    /// `CKSyncEngine` delegate callback. ``ensureZoneExists(_:collectionID:)``
+    /// and ``reconcileOutbox()`` both call this from inside such callbacks, so
+    /// the send would land within the callback, which CloudKit treats as a
+    /// fatal client bug rather than a recoverable error:
     ///
     ///     BUG IN CLIENT OF CLOUDKIT: Cannot await a call into CKSyncEngine
     ///     from within a delegate callback… Try performing this in a detached
@@ -565,6 +651,8 @@ public final class SwiftDataSyncEngine {
     ///
     /// `Task.detached` is that advice: it inherits no actor context, so the
     /// send runs off the main actor and outside any callback in flight.
+    ///
+    /// - Parameter engine: The engine whose pending changes should be sent.
     private func sendChanges(using engine: CKSyncEngine) {
         Task.detached { [weak self] in
             do {
@@ -578,6 +666,14 @@ public final class SwiftDataSyncEngine {
 
 extension SwiftDataSyncEngine: CKSyncEngineDelegate {
 
+    /// Handles an event reported by either sync engine.
+    ///
+    /// Called by CloudKit; don't call it directly.
+    ///
+    /// - Parameters:
+    ///   - event: The event to handle.
+    ///   - syncEngine: The engine that reported it, which identifies whether
+    ///     the event concerns the private or the shared database.
     public func handleEvent(
         _ event: CKSyncEngine.Event,
         syncEngine: CKSyncEngine
@@ -641,6 +737,17 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
     }
 
+    /// Materialises the next batch of records for CloudKit to upload.
+    ///
+    /// Pending changes with no matching durable operation and no fallback
+    /// record are dropped from the engine's queue rather than sent as empty
+    /// saves. Called by CloudKit; don't call it directly.
+    ///
+    /// - Parameters:
+    ///   - context: The scope and options for the send in flight.
+    ///   - syncEngine: The engine requesting the batch.
+    /// - Returns: The batch to upload, or `nil` when nothing in scope is
+    ///   pending or the durable outbox couldn't be read.
     public func nextRecordZoneChangeBatch(
         _ context: CKSyncEngine.SendChangesContext,
         syncEngine: CKSyncEngine
@@ -701,9 +808,17 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         ) { materialisedRecords[$0] }
     }
 
-    /// Groups a fetch event's modifications/deletions by zone and applies
-    /// each zone's batch separately, since different zones in the same
-    /// fetch can belong to different collections with different roles.
+    /// Applies fetched records and deletions to the local store, one zone at
+    /// a time.
+    ///
+    /// The batch is grouped by zone because zones in the same fetch can belong
+    /// to different collections, and a failure in one zone must not abandon
+    /// the others.
+    ///
+    /// - Parameters:
+    ///   - event: The fetched changes to apply.
+    ///   - syncEngine: The engine that fetched them, which determines the role
+    ///     the changes are applied under.
     private func applyFetchedChanges(
         _ event: CKSyncEngine.Event.FetchedRecordZoneChanges,
         syncEngine: CKSyncEngine
@@ -743,6 +858,15 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
     }
 
+    /// Recovers from zones that disappeared from a database.
+    ///
+    /// A deleted shared zone means access was revoked; a deleted owned zone
+    /// means the zone was reset and its records must be recreated and
+    /// re-uploaded.
+    ///
+    /// - Parameters:
+    ///   - event: The database changes CloudKit reported.
+    ///   - syncEngine: The engine that reported them.
     private func handleFetchedDatabaseChanges(
         _ event: CKSyncEngine.Event.FetchedDatabaseChanges,
         syncEngine: CKSyncEngine
@@ -762,6 +886,15 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
     }
 
+    /// Records the outcome of zone creations and deletions.
+    ///
+    /// Confirmed zones are marked prepared for this session; retryable
+    /// failures are requeued, and permanent ones surface as a sync error.
+    ///
+    /// - Parameters:
+    ///   - event: The zone changes CloudKit accepted or rejected.
+    ///   - syncEngine: The engine that sent them. Only the private engine
+    ///     creates zones, so shared-database events are ignored.
     private func handleSentDatabaseChanges(
         _ event: CKSyncEngine.Event.SentDatabaseChanges,
         syncEngine: CKSyncEngine
@@ -800,6 +933,10 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
     }
 
+    /// Stops tracking a shared zone this device no longer has access to and
+    /// asks the adapter to retain what it can locally.
+    ///
+    /// - Parameter zoneID: The revoked zone.
     private func recoverFromRevokedShare(_ zoneID: CKRecordZone.ID) {
         let revokedCollectionID = collectionID(for: zoneID)
         sharedZones.remove(zoneID)
@@ -821,6 +958,11 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
     }
 
+    /// Asks the adapter to requeue a collection's records for upload, then
+    /// reconciles the outbox.
+    ///
+    /// - Parameter collectionID: The collection to requeue, or `nil` to
+    ///   requeue every collection this device owns.
     private func requeueRecords(forCollection collectionID: UUID?) {
         do {
             try store.requeueRecords(forCollection: collectionID)
@@ -834,6 +976,16 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
     }
 
+    /// Records the outcome of every record CloudKit accepted or rejected.
+    ///
+    /// Accepted changes clear their outbox rows. Conflicts are handed to the
+    /// adapter's merge policy and retried, other retryable failures are
+    /// requeued, and permanent rejections are marked failed without
+    /// discarding local data.
+    ///
+    /// - Parameters:
+    ///   - event: The record changes CloudKit accepted or rejected.
+    ///   - syncEngine: The engine that sent them, and which receives retries.
     private func handleSentRecordZoneChanges(
         _ event: CKSyncEngine.Event.SentRecordZoneChanges,
         syncEngine: CKSyncEngine
@@ -896,6 +1048,7 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 }
                 lastSyncError =
                     "A saved change couldn't sync to iCloud. It remains on this device and was not discarded."
+                lastRejectionReason = String(describing: failure.error.code)
                 logger.error(
                     "CloudKit rejected save \(record.recordID): \(failure.error)"
                 )
@@ -923,6 +1076,7 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
             } else {
                 lastSyncError =
                     "A deletion couldn't sync to iCloud. The local recovery copy remains available."
+                lastRejectionReason = String(describing: error.code)
                 logger.error("CloudKit rejected delete \(recordID): \(error)")
             }
         }
@@ -947,6 +1101,13 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
     }
 
+    /// Durably notes why a retryable change failed, so the reason survives
+    /// relaunch.
+    ///
+    /// - Parameters:
+    ///   - recordID: The CloudKit identity of the failed change.
+    ///   - mutation: The operation that failed.
+    ///   - category: The `CKError.Code` name to record.
     private func recordAttemptFailure(
         recordID: CKRecord.ID,
         mutation: SwiftDataSyncMutation,
@@ -965,6 +1126,12 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
     }
 
+    /// Reacts to the iCloud account signing in, out, or switching.
+    ///
+    /// Switching accounts invalidates every zone confirmation, so owned zones
+    /// are recreated and their records requeued under the new identity.
+    ///
+    /// - Parameter event: The account change CloudKit reported.
     private func handleAccountChange(
         _ event: CKSyncEngine.Event.AccountChange
     ) {
@@ -997,6 +1164,10 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
     }
 
+    /// Reports a failure that leaves local data intact and will be retried.
+    ///
+    /// - Parameter error: The underlying CloudKit failure, logged rather than
+    ///   shown to the person using the app.
     private func recordTransientSyncFailure(_ error: any Error) {
         lastSyncError =
             "iCloud couldn't be reached. Your changes are saved on this device and will retry."
