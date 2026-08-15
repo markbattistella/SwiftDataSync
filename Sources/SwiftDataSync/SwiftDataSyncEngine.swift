@@ -184,12 +184,26 @@ public final class SwiftDataSyncEngine {
             for zoneID in ownedZones {
                 ensureZoneExists(zoneID)
             }
+            activateSharedEngineIfNeeded()
             reconcileOutbox()
         }
     }
 
     deinit {
         accountChangeTask?.cancel()
+    }
+
+    /// Brings the shared-database engine into existence on a participant device.
+    ///
+    /// `CKSyncEngine` only receives pushes and runs scheduled syncs while the
+    /// instance exists. Nothing else constructs `sharedEngine` in the steady
+    /// state — `reconcileOutbox()` returns at its empty-outbox guard before
+    /// reaching either engine lookup — so deleting this apparent no-op leaves a
+    /// participant with no live engine, and their device stops fetching
+    /// automatically at all.
+    private func activateSharedEngineIfNeeded() {
+        guard !sharedZones.isEmpty else { return }
+        _ = sharedEngine
     }
 
     /// Returns the collection identifier a tracked zone routes for.
@@ -380,10 +394,12 @@ public final class SwiftDataSyncEngine {
     ///
     /// Changes whose collection isn't tracked by any zone yet are left in the
     /// outbox untouched rather than guessed into the wrong zone.
-    public func reconcileOutbox() {
+    ///
+    /// - Returns: The engines that received changes and now need a send.
+    private func stageOutbox() -> [CKSyncEngine] {
         do {
             let changes = try store.pendingChanges()
-            guard !changes.isEmpty, availability == .available else { return }
+            guard !changes.isEmpty, availability == .available else { return [] }
 
             var changesByEngine: [ObjectIdentifier: [CKSyncEngine.PendingRecordZoneChange]] =
                 [:]
@@ -412,19 +428,51 @@ public final class SwiftDataSyncEngine {
 
             try store.save()
 
+            var staged: [CKSyncEngine] = []
             if let privateChanges = changesByEngine[ObjectIdentifier(privateEngine)] {
                 privateEngine.state.add(pendingRecordZoneChanges: privateChanges)
-                sendChanges(using: privateEngine)
+                staged.append(privateEngine)
             }
             if let sharedChanges = changesByEngine[ObjectIdentifier(sharedEngine)] {
                 sharedEngine.state.add(pendingRecordZoneChanges: sharedChanges)
-                sendChanges(using: sharedEngine)
+                staged.append(sharedEngine)
             }
+            return staged
         } catch {
             lastSyncError =
                 "\(configuration.appName) couldn't prepare changes for iCloud. Your \(configuration.dataName) remains saved on this device."
             logger.error("Failed to reconcile sync outbox: \(error)")
+            return []
         }
+    }
+
+    /// Stages the durable outbox and sends it without waiting for the result.
+    public func reconcileOutbox() {
+        for engine in stageOutbox() {
+            sendChanges(using: engine)
+        }
+    }
+
+    /// Stages and sends pending changes, returning only once the send has
+    /// finished or failed.
+    ///
+    /// Awaitable so a caller holding a background task assertion can keep the
+    /// app alive until the upload actually lands. The send runs detached for
+    /// the same reason as ``sendChanges(using:)``, so this must never be called
+    /// from a `CKSyncEngine` delegate callback.
+    public func flushPendingChanges() async {
+        let staged = stageOutbox()
+        guard !staged.isEmpty else { return }
+
+        await Task.detached { [weak self] in
+            for engine in staged {
+                do {
+                    try await engine.sendChanges()
+                } catch {
+                    await self?.recordTransientSyncFailure(error)
+                }
+            }
+        }.value
     }
 
     /// Registers a zone this device owns, creating it in CloudKit if it
@@ -1013,12 +1061,15 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         }
 
         var retries = [CKSyncEngine.PendingRecordZoneChange]()
+        var missingZoneIDs = Set<CKRecordZone.ID>()
 
         for failure in event.failedRecordSaves {
             activeSendHadError = true
             let record = failure.record
 
-            if failure.error.code == .serverRecordChanged,
+            if Self.isMissingZone(failure.error.code) {
+                missingZoneIDs.insert(record.recordID.zoneID)
+            } else if failure.error.code == .serverRecordChanged,
                 let serverRecord = failure.error.serverRecord
             {
                 do {
@@ -1066,6 +1117,8 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 } catch {
                     logger.error("Failed to clear fulfilled deletion: \(error)")
                 }
+            } else if Self.isMissingZone(error.code) {
+                missingZoneIDs.insert(recordID.zoneID)
             } else if SwiftDataSyncRetryPolicy.shouldRetry(error.code) {
                 retries.append(.deleteRecord(recordID))
                 recordAttemptFailure(
@@ -1085,19 +1138,65 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
             syncEngine.state.add(pendingRecordZoneChanges: retries)
         }
 
-        guard didChange else { return }
-
-        do {
-            try store.save()
-            lastSyncedAt = .now
-            if !activeSendHadError {
-                lastSyncError = nil
+        if didChange {
+            do {
+                try store.save()
+                lastSyncedAt = .now
+                if !activeSendHadError {
+                    lastSyncError = nil
+                }
+            } catch {
+                store.rollback()
+                lastSyncError =
+                    "iCloud accepted changes, but \(configuration.appName) couldn't update their local sync status."
+                logger.error("Failed to save sent-record state: \(error)")
             }
-        } catch {
-            store.rollback()
+        }
+
+        // Runs after the save above, never before: recovery rolls the context
+        // back on failure, which would discard the records CloudKit just
+        // accepted if they were still unsaved.
+        for zoneID in missingZoneIDs {
+            recoverFromMissingZone(zoneID, syncEngine: syncEngine)
+        }
+    }
+
+    /// Whether a failure means the zone a change targeted no longer exists.
+    ///
+    /// - Parameter code: The CloudKit failure code.
+    /// - Returns: `true` when the zone is gone and the change can only succeed
+    ///   after the zone is restored or abandoned.
+    nonisolated static func isMissingZone(_ code: CKError.Code) -> Bool {
+        code == .zoneNotFound || code == .userDeletedZone
+    }
+
+    /// Recovers a send that failed because its zone no longer exists.
+    ///
+    /// The same failure means opposite things per database, so the two are
+    /// never merged: an owned zone was reset and its records must be recreated
+    /// and re-uploaded, while a shared zone means access was revoked. Treating
+    /// the shared case as a reset would recreate a zone the owner deliberately
+    /// withdrew.
+    ///
+    /// - Parameters:
+    ///   - zoneID: The zone CloudKit reported as missing.
+    ///   - syncEngine: The engine that reported it, which identifies the database.
+    private func recoverFromMissingZone(
+        _ zoneID: CKRecordZone.ID,
+        syncEngine: CKSyncEngine
+    ) {
+        // `privateEngine` is tested first so the comparison itself doesn't
+        // construct `sharedEngine` on a device that has no shares at all.
+        if syncEngine === privateEngine, ownedZones.contains(zoneID) {
+            preparedZones.remove(zoneID)
             lastSyncError =
-                "iCloud accepted changes, but \(configuration.appName) couldn't update their local sync status."
-            logger.error("Failed to save sent-record state: \(error)")
+                "An iCloud \(configuration.dataName) zone was reset. Your local data is safe and will be uploaded again."
+            ensureZoneExists(zoneID)
+            requeueRecords(forCollection: collectionID(for: zoneID))
+        } else if syncEngine === sharedEngine, sharedZones.contains(zoneID) {
+            recoverFromRevokedShare(zoneID)
+        } else {
+            logger.error("Missing zone \(zoneID) is not tracked; nothing to recover")
         }
     }
 

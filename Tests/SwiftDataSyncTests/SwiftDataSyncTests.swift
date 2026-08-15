@@ -91,6 +91,36 @@ struct SwiftDataSyncTests {
         #expect(!SwiftDataSyncRetryPolicy.shouldRetry(code))
     }
 
+    @Test(
+        "A vanished zone is classified as missing rather than rejected",
+        arguments: [
+            CKError.Code.zoneNotFound,
+            .userDeletedZone,
+        ]
+    )
+    func missingZoneErrorsAreRecoverable(code: CKError.Code) {
+        #expect(SwiftDataSyncEngine.isMissingZone(code))
+
+        // A missing zone is intercepted before the retry policy is consulted,
+        // so the policy still declines it. Making it retryable here instead
+        // would resend into a zone that no longer exists, forever.
+        #expect(!SwiftDataSyncRetryPolicy.shouldRetry(code))
+    }
+
+    @Test(
+        "Ordinary failures are not mistaken for a missing zone",
+        arguments: [
+            CKError.Code.serverRecordChanged,
+            .networkFailure,
+            .permissionFailure,
+            .quotaExceeded,
+            .unknownItem,
+        ]
+    )
+    func otherErrorsAreNotMissingZones(code: CKError.Code) {
+        #expect(!SwiftDataSyncEngine.isMissingZone(code))
+    }
+
     @Test("Pending changes retain app-defined scoping")
     func pendingChangeScoping() {
         let recordID = UUID()
