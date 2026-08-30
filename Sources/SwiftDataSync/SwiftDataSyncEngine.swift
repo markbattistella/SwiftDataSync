@@ -514,22 +514,7 @@ public final class SwiftDataSyncEngine {
     ///   - zoneID: The accepted zone in the participant's shared database.
     ///   - collectionID: The app-defined identifier this zone routes for, if any.
     public func adoptSharedZone(_ zoneID: CKRecordZone.ID, collectionID: UUID? = nil) {
-        do {
-            try store.prepareToAdoptShare(collectionID: collectionID)
-            try store.save()
-        } catch {
-            store.rollback()
-            lastSyncError =
-                "The invitation was accepted, but \(configuration.appName) couldn't protect existing local data. No local data was deleted."
-            logger.error("Failed to prepare local data before share switch: \(error)")
-            return
-        }
-
-        sharedZones.insert(zoneID)
-        if let collectionID {
-            zoneByCollection[collectionID] = zoneID
-        }
-        persistZones()
+        guard trackAdoptedZone(zoneID, collectionID: collectionID) else { return }
 
         // Detached for the same reason as `fetchChangesNow()`: accepting a
         // share can happen while the engine is mid-callback, and awaiting
@@ -544,6 +529,80 @@ public final class SwiftDataSyncEngine {
                 await recordTransientSyncFailure(error)
             }
         }
+    }
+
+    /// Adopts a shared zone and waits for its first fetch to finish, so a
+    /// caller can tell the person whether their invitation actually landed.
+    ///
+    /// ``adoptSharedZone(_:collectionID:)`` returns the moment the zone is
+    /// tracked, before any records exist locally. A screen that dismisses on
+    /// that looks broken: the person taps *Add*, the sheet closes, and nothing
+    /// appears until the fetch lands seconds later. Await this instead when
+    /// there is UI to keep honest.
+    ///
+    /// - Parameters:
+    ///   - zoneID: The accepted zone in the participant's shared database.
+    ///   - collectionID: The app-defined identifier this zone routes for, if any.
+    /// - Returns: What happened, including whether records are present yet.
+    @discardableResult
+    public func adoptSharedZoneAndSync(
+        _ zoneID: CKRecordZone.ID,
+        collectionID: UUID? = nil
+    ) async -> SwiftDataSyncAdoptionOutcome {
+        guard trackAdoptedZone(zoneID, collectionID: collectionID) else {
+            return .failed(
+                "The invitation was accepted, but \(configuration.appName) couldn't protect existing local data. Nothing on this device was changed."
+            )
+        }
+
+        // Detached for the same re-entrancy reason as above; awaiting the
+        // task's value keeps the outcome reportable.
+        let fetch = Task.detached { [sharedEngine] in
+            try await sharedEngine.fetchChanges()
+        }
+
+        do {
+            try await fetch.value
+            recordSuccessfulCloudKitActivity()
+            reconcileOutbox()
+            return .adopted
+        } catch {
+            recordTransientSyncFailure(error)
+            logger.error("Adopted zone \(zoneID.zoneName) but first fetch failed: \(error)")
+            return .adoptedPendingSync(
+                "Added, but iCloud hasn't sent the entries yet. They'll appear here once it catches up."
+            )
+        }
+    }
+
+    /// Protects existing local data, then starts tracking an accepted zone.
+    ///
+    /// - Parameters:
+    ///   - zoneID: The accepted zone.
+    ///   - collectionID: The app-defined identifier this zone routes for, if any.
+    /// - Returns: `false` when local data couldn't be protected, in which case
+    ///   the zone is not adopted and nothing local was deleted.
+    private func trackAdoptedZone(
+        _ zoneID: CKRecordZone.ID,
+        collectionID: UUID?
+    ) -> Bool {
+        do {
+            try store.prepareToAdoptShare(collectionID: collectionID)
+            try store.save()
+        } catch {
+            store.rollback()
+            lastSyncError =
+                "The invitation was accepted, but \(configuration.appName) couldn't protect existing local data. No local data was deleted."
+            logger.error("Failed to prepare local data before share switch: \(error)")
+            return false
+        }
+
+        sharedZones.insert(zoneID)
+        if let collectionID {
+            zoneByCollection[collectionID] = zoneID
+        }
+        persistZones()
+        return true
     }
 
     /// The state-store key for the private engine's serialized state.

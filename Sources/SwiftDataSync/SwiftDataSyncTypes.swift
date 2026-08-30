@@ -104,3 +104,39 @@ public struct SwiftDataSyncPendingChange: Hashable, Sendable {
         self.mutation = mutation
     }
 }
+
+/// The result of adopting a zone someone else shared to this device.
+public enum SwiftDataSyncAdoptionOutcome: Sendable, Equatable {
+
+    /// The zone is tracked and its first fetch completed, so the shared
+    /// records are present locally.
+    case adopted
+
+    /// The zone is tracked, but its first fetch didn't complete. Sync retries
+    /// on its own; the records appear once it succeeds.
+    ///
+    /// The associated value is a message worth showing the person.
+    case adoptedPendingSync(String)
+
+    /// The zone was not adopted because existing local data couldn't be
+    /// protected first. Nothing local was deleted.
+    ///
+    /// The associated value is a message worth showing the person.
+    case failed(String)
+
+    /// Whether the zone is now tracked, whether or not its records arrived.
+    public var isAdopted: Bool {
+        switch self {
+            case .adopted, .adoptedPendingSync: true
+            case .failed: false
+        }
+    }
+
+    /// A message worth showing the person, or `nil` when everything worked.
+    public var message: String? {
+        switch self {
+            case .adopted: nil
+            case .adoptedPendingSync(let message), .failed(let message): message
+        }
+    }
+}
