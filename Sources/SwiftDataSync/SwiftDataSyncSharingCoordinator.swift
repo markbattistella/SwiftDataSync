@@ -21,7 +21,6 @@ private let logger = SimpleLogger(category: .sync)
 @MainActor
 @Observable
 public final class SwiftDataSyncSharingCoordinator {
-
     /// The engine whose owned zones this coordinator can share.
     private let syncManager: SwiftDataSyncEngine
 
@@ -115,15 +114,18 @@ public final class SwiftDataSyncSharingCoordinator {
                 activeShares[zoneID] = existing
                 return true
             }
-        } catch let error as CKError where error.code == .unknownItem {
+        }
+        catch let error as CKError where error.code == .unknownItem {
             // The zone is there but has never been shared. Carry on and
             // create the share below.
             syncManager.recordSuccessfulCloudKitActivity()
-        } catch let error as CKError where SwiftDataSyncEngine.isMissingZone(error.code) {
+        }
+        catch let error as CKError where SwiftDataSyncEngine.isMissingZone(error.code) {
             // The zone itself has never reached the server, so there is
             // nothing to attach a share to yet. Create it first.
             guard await createZone(zoneID, in: database) else { return false }
-        } catch {
+        }
+        catch {
             fail(zoneID, with: error, whileDoing: "read the existing share")
             return false
         }
@@ -135,12 +137,14 @@ public final class SwiftDataSyncSharingCoordinator {
             syncManager.recordSuccessfulCloudKitActivity()
             activeShares[zoneID] = (savedRecord as? CKShare) ?? share
             return true
-        } catch let error as CKError where SwiftDataSyncEngine.isMissingZone(error.code) {
+        }
+        catch let error as CKError where SwiftDataSyncEngine.isMissingZone(error.code) {
             // Lost a race with a zone deletion, or the zone vanished between
             // the read above and this save. Recreate it and try once more.
             guard await createZone(zoneID, in: database) else { return false }
             return await saveShare(for: zoneID, title: title, in: database)
-        } catch {
+        }
+        catch {
             fail(zoneID, with: error, whileDoing: "create the share")
             return false
         }
@@ -160,10 +164,12 @@ public final class SwiftDataSyncSharingCoordinator {
             _ = try await database.save(CKRecordZone(zoneID: zoneID))
             syncManager.recordSuccessfulCloudKitActivity()
             return true
-        } catch let error as CKError where error.code == .serverRecordChanged {
+        }
+        catch let error as CKError where error.code == .serverRecordChanged {
             // Another device created it first, which is the outcome we wanted.
             return true
-        } catch {
+        }
+        catch {
             fail(zoneID, with: error, whileDoing: "create the zone to share")
             return false
         }
@@ -189,7 +195,8 @@ public final class SwiftDataSyncSharingCoordinator {
             syncManager.recordSuccessfulCloudKitActivity()
             activeShares[zoneID] = (savedRecord as? CKShare) ?? share
             return true
-        } catch {
+        }
+        catch {
             fail(zoneID, with: error, whileDoing: "create the share")
             return false
         }

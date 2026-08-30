@@ -10,7 +10,6 @@ import Foundation
 ///
 /// A device can hold both roles at once, for different zones.
 public enum SwiftDataSyncRole: String, Codable, Sendable {
-
     /// This user owns the custom zone in their private database.
     case owner
 
@@ -20,7 +19,6 @@ public enum SwiftDataSyncRole: String, Codable, Sendable {
 
 /// The availability of the configured iCloud account.
 public enum SwiftDataSyncAvailability: Equatable, Sendable {
-
     /// The initial account check hasn't completed.
     case checking
 
@@ -58,7 +56,6 @@ public enum SwiftDataSyncAvailability: Equatable, Sendable {
 
 /// A durable local operation awaiting CloudKit delivery.
 public enum SwiftDataSyncMutation: String, Codable, Sendable {
-
     /// Create or update a record.
     case save
 
@@ -71,7 +68,6 @@ public enum SwiftDataSyncMutation: String, Codable, Sendable {
 /// This is the only shape in which outbox rows cross the package boundary,
 /// which keeps `ModelContext` and its models on the main actor.
 public struct SwiftDataSyncPendingChange: Hashable, Sendable {
-
     /// The stable local identity used as the CloudKit record name.
     public let recordID: UUID
 
@@ -107,7 +103,6 @@ public struct SwiftDataSyncPendingChange: Hashable, Sendable {
 
 /// The result of adopting a zone someone else shared to this device.
 public enum SwiftDataSyncAdoptionOutcome: Sendable, Equatable {
-
     /// The zone is tracked and its first fetch completed, so the shared
     /// records are present locally.
     case adopted

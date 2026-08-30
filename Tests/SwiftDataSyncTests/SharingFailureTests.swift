@@ -12,7 +12,6 @@ import Testing
 
 @Suite("Sharing failures")
 struct SharingFailureTests {
-
     private let appName = "Example"
 
     private func message(_ code: CKError.Code) -> String {

@@ -32,7 +32,6 @@ private let logger = SimpleLogger(category: .sync)
 @MainActor
 @Observable
 public final class SwiftDataSyncEngine {
-
     /// The device's relationship to a tracked zone.
     public typealias Role = SwiftDataSyncRole
 
@@ -268,7 +267,8 @@ public final class SwiftDataSyncEngine {
                 @unknown default:
                     availability = .temporarilyUnavailable
             }
-        } catch {
+        }
+        catch {
             guard requestID == accountStatusRequestID else { return }
             if availability != .available {
                 availability = .temporarilyUnavailable
@@ -383,7 +383,8 @@ public final class SwiftDataSyncEngine {
                     try await sharedEngine.fetchChanges()
                 }
                 await recordSuccessfulCloudKitActivity()
-            } catch {
+            }
+            catch {
                 await recordTransientSyncFailure(error)
             }
         }
@@ -438,7 +439,8 @@ public final class SwiftDataSyncEngine {
                 staged.append(sharedEngine)
             }
             return staged
-        } catch {
+        }
+        catch {
             lastSyncError =
                 "\(configuration.appName) couldn't prepare changes for iCloud. Your \(configuration.dataName) remains saved on this device."
             logger.error("Failed to reconcile sync outbox: \(error)")
@@ -468,7 +470,8 @@ public final class SwiftDataSyncEngine {
             for engine in staged {
                 do {
                     try await engine.sendChanges()
-                } catch {
+                }
+                catch {
                     await self?.recordTransientSyncFailure(error)
                 }
             }
@@ -525,7 +528,8 @@ public final class SwiftDataSyncEngine {
                 try await sharedEngine.fetchChanges()
                 await recordSuccessfulCloudKitActivity()
                 await reconcileOutbox()
-            } catch {
+            }
+            catch {
                 await recordTransientSyncFailure(error)
             }
         }
@@ -566,7 +570,8 @@ public final class SwiftDataSyncEngine {
             recordSuccessfulCloudKitActivity()
             reconcileOutbox()
             return .adopted
-        } catch {
+        }
+        catch {
             recordTransientSyncFailure(error)
             logger.error("Adopted zone \(zoneID.zoneName) but first fetch failed: \(error)")
             return .adoptedPendingSync(
@@ -589,7 +594,8 @@ public final class SwiftDataSyncEngine {
         do {
             try store.prepareToAdoptShare(collectionID: collectionID)
             try store.save()
-        } catch {
+        }
+        catch {
             store.rollback()
             lastSyncError =
                 "The invitation was accepted, but \(configuration.appName) couldn't protect existing local data. No local data was deleted."
@@ -652,7 +658,8 @@ public final class SwiftDataSyncEngine {
         guard let data = stateStore.data(forKey: key) else { return [] }
         do {
             return try JSONDecoder().decode([PersistedZone].self, from: data)
-        } catch {
+        }
+        catch {
             logger.error("Failed to restore tracked zones: \(error)")
             return []
         }
@@ -678,7 +685,8 @@ public final class SwiftDataSyncEngine {
         }
         do {
             stateStore.set(try JSONEncoder().encode(owned + shared), forKey: zonesKey)
-        } catch {
+        }
+        catch {
             logger.error("Failed to persist tracked zones: \(error)")
         }
     }
@@ -716,7 +724,8 @@ public final class SwiftDataSyncEngine {
                 CKSyncEngine.State.Serialization.self,
                 from: data
             )
-        } catch {
+        }
+        catch {
             logger.error("Failed to restore CKSyncEngine state: \(error)")
             return nil
         }
@@ -736,7 +745,8 @@ public final class SwiftDataSyncEngine {
                 try JSONEncoder().encode(serialization),
                 forKey: key
             )
-        } catch {
+        }
+        catch {
             logger.error("Failed to persist CKSyncEngine state: \(error)")
         }
     }
@@ -764,7 +774,8 @@ public final class SwiftDataSyncEngine {
         Task.detached { [weak self] in
             do {
                 try await engine.sendChanges()
-            } catch {
+            }
+            catch {
                 await self?.recordTransientSyncFailure(error)
             }
         }
@@ -772,7 +783,6 @@ public final class SwiftDataSyncEngine {
 }
 
 extension SwiftDataSyncEngine: CKSyncEngineDelegate {
-
     /// Handles an event reported by either sync engine.
     ///
     /// Called by CloudKit; don't call it directly.
@@ -865,12 +875,13 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
             }
         guard !pendingEngineChanges.isEmpty else { return nil }
 
-        var records = [CKRecord.ID: CKRecord]()
+        var records: [CKRecord.ID: CKRecord] = [:]
         let pendingStoreChanges: [SwiftDataSyncPendingChange]
 
         do {
             pendingStoreChanges = try store.pendingChanges()
-        } catch {
+        }
+        catch {
             lastSyncError =
                 "\(configuration.appName) couldn't read a queued iCloud change. Local data is unchanged."
             logger.error("Failed to read pending store changes: \(error)")
@@ -892,17 +903,20 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                     )
                 {
                     records[recordID] = record
-                } else if let legacyRecord = try store.makeFallbackRecord(
+                }
+                else if let legacyRecord = try store.makeFallbackRecord(
                     for: id,
                     in: recordID.zoneID
                 ) {
                     records[recordID] = legacyRecord
-                } else {
+                }
+                else {
                     syncEngine.state.remove(
                         pendingRecordZoneChanges: [.saveRecord(recordID)]
                     )
                 }
-            } catch {
+            }
+            catch {
                 lastSyncError =
                     "\(configuration.appName) couldn't materialise a queued iCloud change. Local data is unchanged."
                 logger.error("Failed to materialise queued record: \(error)")
@@ -956,7 +970,8 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 guard didChange else { continue }
                 try store.save()
                 store.didApplyRemoteChanges()
-            } catch {
+            }
+            catch {
                 store.rollback()
                 lastSyncError =
                     "\(configuration.appName) received iCloud changes but couldn't save them locally. It will retry."
@@ -983,7 +998,8 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
 
             if syncEngine === sharedEngine, sharedZones.contains(zoneID) {
                 recoverFromRevokedShare(zoneID)
-            } else if syncEngine === privateEngine, ownedZones.contains(zoneID) {
+            }
+            else if syncEngine === privateEngine, ownedZones.contains(zoneID) {
                 preparedZones.remove(zoneID)
                 lastSyncError =
                     "An iCloud \(configuration.dataName) zone was reset. Your local data is safe and will be uploaded again."
@@ -1023,7 +1039,8 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 )
                 lastSyncError =
                     "iCloud couldn't prepare the \(configuration.dataName) yet. Your changes remain saved on this device and will retry."
-            } else {
+            }
+            else {
                 lastSyncError =
                     "iCloud couldn't create the \(configuration.dataName)'s sync area. Local data remains available."
             }
@@ -1057,7 +1074,8 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
             try store.save()
             lastSyncError =
                 "Access to a shared \(configuration.dataName) ended. It was retained locally where possible."
-        } catch {
+        }
+        catch {
             store.rollback()
             lastSyncError =
                 "Access to a shared \(configuration.dataName) ended, but \(configuration.appName) couldn't finish cleaning up locally."
@@ -1075,7 +1093,8 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
             try store.requeueRecords(forCollection: collectionID)
             try store.save()
             reconcileOutbox()
-        } catch {
+        }
+        catch {
             store.rollback()
             lastSyncError =
                 "Your \(configuration.dataName) is safe locally, but \(configuration.appName) couldn't prepare it to re-upload."
@@ -1104,7 +1123,8 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 didChange =
                     try store.acceptSavedRecord(savedRecord)
                     || didChange
-            } catch {
+            }
+            catch {
                 logger.error("Failed to accept saved record: \(error)")
             }
         }
@@ -1114,12 +1134,13 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 didChange =
                     try store.acceptDeletedRecordID(deletedRecordID)
                     || didChange
-            } catch {
+            }
+            catch {
                 logger.error("Failed to accept deleted record: \(error)")
             }
         }
 
-        var retries = [CKSyncEngine.PendingRecordZoneChange]()
+        var retries: [CKSyncEngine.PendingRecordZoneChange] = []
         var missingZoneIDs = Set<CKRecordZone.ID>()
 
         for failure in event.failedRecordSaves {
@@ -1128,7 +1149,8 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
 
             if Self.isMissingZone(failure.error.code) {
                 missingZoneIDs.insert(record.recordID.zoneID)
-            } else if failure.error.code == .serverRecordChanged,
+            }
+            else if failure.error.code == .serverRecordChanged,
                 let serverRecord = failure.error.serverRecord
             {
                 do {
@@ -1137,23 +1159,27 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                         serverRecord: serverRecord
                     )
                     try store.save()
-                } catch {
+                }
+                catch {
                     store.rollback()
                     logger.error("Failed to preserve CloudKit conflict: \(error)")
                 }
                 retries.append(.saveRecord(record.recordID))
-            } else if SwiftDataSyncRetryPolicy.shouldRetry(failure.error.code) {
+            }
+            else if SwiftDataSyncRetryPolicy.shouldRetry(failure.error.code) {
                 retries.append(.saveRecord(record.recordID))
                 recordAttemptFailure(
                     recordID: record.recordID,
                     mutation: .save,
                     category: String(describing: failure.error.code)
                 )
-            } else {
+            }
+            else {
                 do {
                     try store.markRecordFailed(record)
                     didChange = true
-                } catch {
+                }
+                catch {
                     logger.error("Failed to mark rejected record: \(error)")
                 }
                 lastSyncError =
@@ -1173,19 +1199,23 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                     didChange =
                         try store.acceptDeletedRecordID(recordID)
                         || didChange
-                } catch {
+                }
+                catch {
                     logger.error("Failed to clear fulfilled deletion: \(error)")
                 }
-            } else if Self.isMissingZone(error.code) {
+            }
+            else if Self.isMissingZone(error.code) {
                 missingZoneIDs.insert(recordID.zoneID)
-            } else if SwiftDataSyncRetryPolicy.shouldRetry(error.code) {
+            }
+            else if SwiftDataSyncRetryPolicy.shouldRetry(error.code) {
                 retries.append(.deleteRecord(recordID))
                 recordAttemptFailure(
                     recordID: recordID,
                     mutation: .delete,
                     category: String(describing: error.code)
                 )
-            } else {
+            }
+            else {
                 lastSyncError =
                     "A deletion couldn't sync to iCloud. The local recovery copy remains available."
                 lastRejectionReason = String(describing: error.code)
@@ -1204,7 +1234,8 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 if !activeSendHadError {
                     lastSyncError = nil
                 }
-            } catch {
+            }
+            catch {
                 store.rollback()
                 lastSyncError =
                     "iCloud accepted changes, but \(configuration.appName) couldn't update their local sync status."
@@ -1252,9 +1283,11 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 "An iCloud \(configuration.dataName) zone was reset. Your local data is safe and will be uploaded again."
             ensureZoneExists(zoneID)
             requeueRecords(forCollection: collectionID(for: zoneID))
-        } else if syncEngine === sharedEngine, sharedZones.contains(zoneID) {
+        }
+        else if syncEngine === sharedEngine, sharedZones.contains(zoneID) {
             recoverFromRevokedShare(zoneID)
-        } else {
+        }
+        else {
             logger.error("Missing zone \(zoneID) is not tracked; nothing to recover")
         }
     }
@@ -1279,7 +1312,8 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 category: category
             )
             try store.save()
-        } catch {
+        }
+        catch {
             logger.error("Failed to update durable attempt state: \(error)")
         }
     }
