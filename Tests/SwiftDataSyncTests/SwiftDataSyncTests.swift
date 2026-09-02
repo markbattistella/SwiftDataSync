@@ -12,7 +12,6 @@ import Testing
 
 @Suite("SwiftDataSync contracts")
 struct SwiftDataSyncTests {
-
     private let configuration = SwiftDataSyncConfiguration(
         containerIdentifier: "iCloud.com.example.Example",
         appGroupIdentifier: "group.com.example.Example",

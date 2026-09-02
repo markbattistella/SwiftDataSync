@@ -24,7 +24,6 @@ import Foundation
 ///   Only stable identifiers and CloudKit records cross this boundary.
 @MainActor
 public protocol SwiftDataSyncStore: AnyObject {
-
     /// Returns durable changes across every collection this device tracks.
     ///
     /// Each change's `collectionID` is how the engine routes it to a zone, so
@@ -213,7 +212,6 @@ public protocol SwiftDataSyncStore: AnyObject {
 }
 
 extension SwiftDataSyncStore {
-
     /// Returns `nil`, for adapters with no legacy queued saves to rebuild.
     ///
     /// - Parameters:

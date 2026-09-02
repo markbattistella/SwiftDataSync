@@ -8,7 +8,6 @@ import CloudKit
 
 /// Classifies CloudKit failures that are safe to retry without user action.
 public enum SwiftDataSyncRetryPolicy {
-
     /// Returns whether a failed CloudKit operation should stay queued for
     /// retry.
     ///
