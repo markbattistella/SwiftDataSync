@@ -1166,6 +1166,35 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 }
                 retries.append(.saveRecord(record.recordID))
             }
+            else if failure.error.code == .unknownItem,
+                record.recordChangeTag != nil
+            {
+                // The record was sent as an update — it carried a change tag —
+                // but the server has no such record. The archived system fields
+                // are stale, so every future attempt would be rejected the same
+                // way. Dropping them turns the retry into a create, which puts
+                // the record back instead of stranding it. A record sent with
+                // no change tag was already a create, so an `unknownItem` there
+                // is genuinely permanent and falls through below.
+                do {
+                    try forgetServerRecord(record.recordID)
+                    try store.save()
+                    didChange = true
+                }
+                catch {
+                    store.rollback()
+                    logger.error("Failed to clear stale system fields: \(error)")
+                }
+                retries.append(.saveRecord(record.recordID))
+                recordAttemptFailure(
+                    recordID: record.recordID,
+                    mutation: .save,
+                    category: String(describing: failure.error.code)
+                )
+                logger.error(
+                    "Retrying \(record.recordID) as a create; the server has no record for its change tag"
+                )
+            }
             else if SwiftDataSyncRetryPolicy.shouldRetry(failure.error.code) {
                 retries.append(.saveRecord(record.recordID))
                 recordAttemptFailure(
@@ -1177,6 +1206,11 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
             else {
                 do {
                     try store.markRecordFailed(record)
+                    try discardRejectedChange(
+                        recordID: record.recordID,
+                        mutation: .save,
+                        syncEngine: syncEngine
+                    )
                     didChange = true
                 }
                 catch {
@@ -1216,6 +1250,17 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
                 )
             }
             else {
+                do {
+                    try discardRejectedChange(
+                        recordID: recordID,
+                        mutation: .delete,
+                        syncEngine: syncEngine
+                    )
+                    didChange = true
+                }
+                catch {
+                    logger.error("Failed to clear rejected deletion: \(error)")
+                }
                 lastSyncError =
                     "A deletion couldn't sync to iCloud. The local recovery copy remains available."
                 lastRejectionReason = String(describing: error.code)
@@ -1290,6 +1335,45 @@ extension SwiftDataSyncEngine: CKSyncEngineDelegate {
         else {
             logger.error("Missing zone \(zoneID) is not tracked; nothing to recover")
         }
+    }
+
+    /// Clears the archived system fields behind a save the server could not
+    /// match to an existing record.
+    ///
+    /// - Parameter recordID: The CloudKit identity whose archive is stale.
+    private func forgetServerRecord(_ recordID: CKRecord.ID) throws {
+        guard let id = UUID(uuidString: recordID.recordName) else { return }
+        try store.forgetServerRecord(recordID: id)
+    }
+
+    /// Retires a change CloudKit refused permanently, from both the durable
+    /// outbox and the engine's own queue.
+    ///
+    /// Without this a rejected change is restaged on every reconcile. CloudKit
+    /// applies a zone's changes atomically, so it fails again and takes every
+    /// innocent change for that zone with it as `.batchRequestFailed` — one bad
+    /// record silently blocks a device's uploads for that zone indefinitely.
+    /// The local model is untouched; only the instruction to keep sending it is
+    /// dropped.
+    ///
+    /// - Parameters:
+    ///   - recordID: The CloudKit identity of the rejected change.
+    ///   - mutation: The operation that was rejected.
+    ///   - syncEngine: The engine holding the queued change.
+    private func discardRejectedChange(
+        recordID: CKRecord.ID,
+        mutation: SwiftDataSyncMutation,
+        syncEngine: CKSyncEngine
+    ) throws {
+        let pendingChange: CKSyncEngine.PendingRecordZoneChange =
+            switch mutation {
+                case .save: .saveRecord(recordID)
+                case .delete: .deleteRecord(recordID)
+            }
+        syncEngine.state.remove(pendingRecordZoneChanges: [pendingChange])
+
+        guard let id = UUID(uuidString: recordID.recordName) else { return }
+        try store.discardRejectedChange(recordID: id, mutation: mutation)
     }
 
     /// Durably notes why a retryable change failed, so the reason survives

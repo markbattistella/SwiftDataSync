@@ -78,6 +78,15 @@ struct SwiftDataSyncTests {
         #expect(SwiftDataSyncRetryPolicy.shouldRetry(code))
     }
 
+    @Test("A record rolled back with its batch is retried, not abandoned")
+    func batchRequestFailureRetries() {
+        // CloudKit applies a zone's changes atomically, so one genuinely bad
+        // record fails with its own code while every innocent sibling comes
+        // back as `.batchRequestFailed`. Classifying that as permanent would
+        // discard changes that were never wrong.
+        #expect(SwiftDataSyncRetryPolicy.shouldRetry(.batchRequestFailed))
+    }
+
     @Test(
         "Permanent CloudKit errors are not retried indefinitely",
         arguments: [

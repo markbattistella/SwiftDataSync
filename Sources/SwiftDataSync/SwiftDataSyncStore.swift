@@ -136,6 +136,40 @@ public protocol SwiftDataSyncStore: AnyObject {
     /// - Parameter record: The record CloudKit permanently rejected.
     func markRecordFailed(_ record: CKRecord) throws
 
+    /// Discards a record's archived CloudKit system fields.
+    ///
+    /// Called when a save was rejected because the server has no such record
+    /// despite the local copy carrying a change tag for it. Dropping the
+    /// archive turns the next attempt from a doomed update into a create, which
+    /// restores the record rather than abandoning it.
+    ///
+    /// The local model and its field values must survive; only the archived
+    /// identity metadata is cleared.
+    ///
+    /// - Parameter recordID: The stable local identity of the record.
+    func forgetServerRecord(recordID: UUID) throws
+
+    /// Removes the durable outbox row for a change CloudKit will never accept.
+    ///
+    /// The local model itself must survive: this drops only the instruction to
+    /// keep sending it. ``markRecordFailed(_:)`` is called first, so the row is
+    /// discarded after the model has been marked failed and can still be
+    /// surfaced or retried deliberately by the app.
+    ///
+    /// - Important: A permanently rejected change that stays in the outbox is
+    ///   restaged on every reconcile, and because CloudKit applies a zone's
+    ///   changes atomically it takes every other change for that zone down with
+    ///   it as `.batchRequestFailed`. One rejected record then blocks the whole
+    ///   zone forever. Implementations must actually delete the row.
+    ///
+    /// - Parameters:
+    ///   - recordID: The stable local identity of the rejected change.
+    ///   - mutation: The operation that was rejected.
+    func discardRejectedChange(
+        recordID: UUID,
+        mutation: SwiftDataSyncMutation
+    ) throws
+
     /// Records the failure category for a retryable durable operation.
     ///
     /// - Parameters:
