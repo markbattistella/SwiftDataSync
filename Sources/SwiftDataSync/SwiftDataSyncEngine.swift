@@ -506,6 +506,41 @@ public final class SwiftDataSyncEngine {
         sendChanges(using: privateEngine)
     }
 
+    /// Stops tracking a zone this device no longer has in CloudKit.
+    ///
+    /// The counterpart to ``ensureZoneExists(_:collectionID:)``. Deleting a zone through
+    /// `CKDatabase` directly — which is the only way to remove one the engine did not delete
+    /// itself — leaves the engine still listing it in ``ownedZones``, and that set is
+    /// persisted, so the zone reappears on the next launch as though nothing happened. This
+    /// is how an app tells the engine the deletion happened.
+    ///
+    /// Only forgets. It does not delete anything from CloudKit, and it does not touch local
+    /// data: call it *after* the zone is confirmed gone from the server.
+    ///
+    /// - Parameter zoneID: The zone to stop tracking.
+    public func forgetZone(_ zoneID: CKRecordZone.ID) {
+        let wasOwned = ownedZones.remove(zoneID) != nil
+        let wasShared = sharedZones.remove(zoneID) != nil
+
+        guard wasOwned || wasShared else {
+            logger.debug("forgetZone ignored — \(zoneID.zoneName) was not being tracked")
+            return
+        }
+
+        // Without this the collection keeps routing records at a zone that no longer exists,
+        // and every save for it fails for as long as the mapping survives.
+        for (collectionID, mapped) in zoneByCollection where mapped == zoneID {
+            zoneByCollection.removeValue(forKey: collectionID)
+        }
+
+        // Dropped so a zone of the same name created later is prepared again rather than
+        // assumed to already exist.
+        preparedZones.remove(zoneID)
+
+        persistZones()
+        logger.info("Stopped tracking zone \(zoneID.zoneName)")
+    }
+
     /// Adopts a zone someone else shared to this device, alongside any zones
     /// it already owns or participates in.
     ///
